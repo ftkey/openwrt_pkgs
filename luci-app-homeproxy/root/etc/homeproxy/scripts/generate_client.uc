@@ -751,7 +751,6 @@ if (!isEmpty(main_node)) {
 				config.endpoints[length(config.endpoints)-1].detour = get_outbound(cfg.outbound);
 				if (cfg.domain_resolver || cfg.domain_strategy)
 					config.endpoints[length(config.endpoints)-1].domain_resolver = {
-						action: 'action',
 						server: get_resolver(cfg.domain_resolver || default_outbound_dns),
 						strategy: cfg.domain_strategy
 					};
