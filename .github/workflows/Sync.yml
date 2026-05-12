@@ -70,7 +70,7 @@ jobs:
           sync_repo luci-app-wolplus https://github.com/sundaqiang/openwrt-packages.git "luci-app-wolplus" "master"
           sync_repo luci-app-homeproxy https://github.com/VIKINGYFY/homeproxy.git "" "main"
           sync_repo luci-app-adguardhome https://github.com/coolsnowwolf/luci.git "applications/luci-app-adguardhome" "openwrt-23.05"
-          sync_repo luci-app-passwall https://github.com/xiaorouji/openwrt-passwall.git luci-app-passwall
+          sync_repo luci-app-passwall https://github.com/Openwrt-Passwall/openwrt-passwall.git luci-app-passwall
           sync_repo luci-app-socat https://github.com/sbwml/openwrt_pkgs.git luci-app-socat
           sync_repo luci-app-vlmcsd-pkgs https://github.com/sbwml/openwrt_pkgs.git "luci-app-vlmcsd,vlmcsd"
           sync_repo luci-theme-argon-pkgs https://github.com/sbwml/luci-theme-argon.git "luci-theme-argon,luci-app-argon-config" "openwrt-24.10" 
