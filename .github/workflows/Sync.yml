@@ -75,7 +75,7 @@ jobs:
           sync_repo luci-app-vlmcsd-pkgs https://github.com/sbwml/openwrt_pkgs.git "luci-app-vlmcsd,vlmcsd"
           sync_repo luci-theme-argon-pkgs https://github.com/sbwml/luci-theme-argon.git "luci-theme-argon,luci-app-argon-config" "openwrt-24.10" 
           sync_repo luci-app-alist-pkgs https://github.com/sbwml/luci-app-alist.git "luci-app-alist,alist"
-          sync_repo luci-app-nikki-pkgs https://github.com/nikkinikki-org/OpenWrt-nikki "luci-app-nikki,nikki"
+          sync_repo luci-app-nikki-pkgs https://github.com/nikkinikki-org/OpenWrt-nikki "luci-app-nikki,nikki,mihomo-alpha,mihomo-meta"
           #sync_repo luci-app-mihomo-pkgs https://github.com/morytyann/OpenWrt-mihomo "luci-app-mihomo,mihomo"
           #sync_repo luci-theme-argon-pkgs/luci-theme-argon https://github.com/jerrykuku/luci-theme-argon.git "" "master"
           #sync_repo luci-theme-argon-pkgs/luci-app-argon-config https://github.com/jerrykuku/luci-app-argon-config.git "" "master"
