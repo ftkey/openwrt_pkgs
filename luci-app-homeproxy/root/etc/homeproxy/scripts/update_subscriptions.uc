@@ -238,6 +238,9 @@ function parse_mihomo_proxy(proxy) {
 	let config;
 	const tls_sni = proxy.servername || proxy.sni;
 	const tls_fingerprint = proxy['client-fingerprint'] || proxy.fingerprint;
+	const tls_insecure = (proxy['skip-cert-verify'] === true || proxy.insecure === '1' || proxy.allowInsecure === true || proxy.allowInsecure === '1') ? '1'
+		: (proxy['skip-cert-verify'] === false || proxy.insecure === '0' || proxy.allowInsecure === false || proxy.allowInsecure === '0') ? '0'
+		: null;
 
 	switch (proxy.type) {
 	case 'anytls': {
@@ -248,8 +251,6 @@ function parse_mihomo_proxy(proxy) {
 			anytls_fp = null;
 		else if (!has_value(anytls_fp))
 			anytls_fp = 'chrome';
-		const tls_insecure = (proxy['skip-cert-verify'] === true || proxy.allowInsecure === true || proxy.allowInsecure === '1') ? '1'
-			: (proxy['skip-cert-verify'] === false || proxy.allowInsecure === false) ? '0' : null;
 		config = {
 			label: proxy.name,
 			type: 'anytls',
@@ -281,7 +282,7 @@ function parse_mihomo_proxy(proxy) {
 			tls: (proxy.tls === true) ? '1' : '0',
 			tls_sni,
 			tls_alpn: normalize_alpn(proxy.alpn),
-			tls_insecure: bool_to_uci(proxy['skip-cert-verify']),
+			tls_insecure,
 			tls_utls: sing_features.with_utls ? tls_fingerprint : null,
 			tcp_fast_open: (proxy.tfo === true) ? '1' : null
 		};
@@ -307,7 +308,7 @@ function parse_mihomo_proxy(proxy) {
 			tls: '1',
 			tls_sni,
 			tls_alpn: normalize_alpn(proxy.alpn),
-			tls_insecure: bool_to_uci(proxy['skip-cert-verify']),
+			tls_insecure,
 			tcp_fast_open: (proxy.tfo === true) ? '1' : null
 		};
 		break;
@@ -332,7 +333,7 @@ function parse_mihomo_proxy(proxy) {
 			tls: '1',
 			tls_sni,
 			tls_alpn: normalize_alpn(proxy.alpn),
-			tls_insecure: bool_to_uci(proxy['skip-cert-verify']),
+			tls_insecure,
 			tcp_fast_open: (proxy.tfo === true) ? '1' : null
 		};
 		break;
@@ -348,7 +349,7 @@ function parse_mihomo_proxy(proxy) {
 			tls: (proxy.tls === true || proxy['reality-opts']) ? '1' : '0',
 			tls_sni,
 			tls_alpn: normalize_alpn(proxy.alpn),
-			tls_insecure: bool_to_uci(proxy['skip-cert-verify']),
+			tls_insecure,
 			tls_utls: sing_features.with_utls ? tls_fingerprint : null,
 			tls_reality: proxy['reality-opts'] ? '1' : '0',
 			tls_reality_public_key: proxy['reality-opts'] ? proxy['reality-opts']['public-key'] : null,
@@ -367,7 +368,7 @@ function parse_mihomo_proxy(proxy) {
 			tls: (proxy.tls === false) ? '0' : '1',
 			tls_sni,
 			tls_alpn: normalize_alpn(proxy.alpn),
-			tls_insecure: bool_to_uci(proxy['skip-cert-verify']),
+			tls_insecure,
 			tls_utls: sing_features.with_utls ? tls_fingerprint : null,
 			tcp_fast_open: (proxy.tfo === true) ? '1' : null
 		};
@@ -409,7 +410,7 @@ function parse_mihomo_proxy(proxy) {
 			socks_version: (proxy.type === 'socks4a') ? '4a' : ((proxy.type === 'socks4') ? '4' : '5'),
 			tls: (proxy.tls === true) ? '1' : '0',
 			tls_sni,
-			tls_insecure: bool_to_uci(proxy['skip-cert-verify']),
+			tls_insecure,
 			tls_utls: sing_features.with_utls ? tls_fingerprint : null,
 			tcp_fast_open: (proxy.tfo === true) ? '1' : null
 		};
@@ -424,7 +425,7 @@ function parse_mihomo_proxy(proxy) {
 			password: proxy.password,
 			tls: (proxy.tls === true) ? '1' : '0',
 			tls_sni,
-			tls_insecure: bool_to_uci(proxy['skip-cert-verify']),
+			tls_insecure,
 			tls_utls: sing_features.with_utls ? tls_fingerprint : null,
 			tcp_fast_open: (proxy.tfo === true) ? '1' : null
 		};
@@ -456,7 +457,7 @@ function parse_mihomo_proxy(proxy) {
 			tls: '1',
 			tls_sni: proxy['disable-sni'] ? null : tls_sni,
 			tls_alpn: normalize_alpn(proxy.alpn),
-			tls_insecure: bool_to_uci(proxy['skip-cert-verify']),
+			tls_insecure,
 			tcp_fast_open: (proxy.tfo === true) ? '1' : null
 		};
 		break;
@@ -546,12 +547,12 @@ function parse_uri(uri) {
 			port: url.port,
 			password: urldecode(url.username),
 			tls: '1',
+			tls_insecure: (params.insecure === '1' || params.allowInsecure === '1') ? '1' : '0',
 			tls_sni: params.sni,
-			tls_insecure: (params.insecure === '1') ? '1' : '0',
 			tls_utls: sing_features.with_utls ? anytls_fp : null
 		};
 
-			break;
+		break;
 		case 'http':
 		case 'https':
 			url = parseURL('http://' + uri[1]) || {};
@@ -570,7 +571,7 @@ function parse_uri(uri) {
 		case 'hysteria':
 			/* https://github.com/HyNetwork/hysteria/wiki/URI-Scheme */
 			url = parseURL('http://' + uri[1]) || {};
-			params = url.searchParams;
+			params = url.searchParams || {};
 
 			if (!sing_features.with_quic || (params.protocol && params.protocol !== 'udp')) {
 				log(sprintf('Skipping unsupported %s node: %s.', uri[0], urldecode(url.hash) || url.hostname));
@@ -593,7 +594,7 @@ function parse_uri(uri) {
 				hysteria_down_mbps: params.downmbps,
 				hysteria_up_mbps: params.upmbps,
 				tls: '1',
-				tls_insecure: (params.insecure in ['true', '1']) ? '1' : '0',
+				tls_insecure: (params.insecure === '1' || params.allowInsecure === '1') ? '1' : '0',
 				tls_sni: params.peer,
 				tls_alpn: params.alpn
 			};
@@ -603,7 +604,7 @@ function parse_uri(uri) {
 		case 'hy2':
 			/* https://v2.hysteria.network/docs/developers/URI-Scheme/ */
 			url = parseURL('http://' + uri[1]) || {};
-			params = url.searchParams;
+			params = url.searchParams || {};
 
 			if (!sing_features.with_quic) {
 				log(sprintf('Skipping unsupported %s node: %s.', uri[0], urldecode(url.hash) || url.hostname));
@@ -623,7 +624,7 @@ function parse_uri(uri) {
 				hysteria_obfs_type: params.obfs,
 				hysteria_obfs_password: params['obfs-password'],
 				tls: '1',
-				tls_insecure: (params.insecure === '1') ? '1' : '0',
+				tls_insecure: (params.insecure === '1' || params.allowInsecure === '1') ? '1' : '0',
 				tls_sni: params.sni
 			};
 
@@ -706,6 +707,7 @@ function parse_uri(uri) {
 				password: urldecode(url.username),
 				transport: (params.type !== 'tcp') ? params.type : null,
 				tls: '1',
+				tls_insecure: (params.insecure === '1' || params.allowInsecure === '1') ? '1' : '0',
 				tls_sni: params.sni
 			};
 			switch(params.type) {
@@ -746,6 +748,7 @@ function parse_uri(uri) {
 				tuic_congestion_control: params.congestion_control,
 				tuic_udp_relay_mode: params.udp_relay_mode,
 				tls: '1',
+				tls_insecure: (params.insecure === '1' || params.allowInsecure === '1') ? '1' : '0',
 				tls_sni: params.sni,
 				tls_alpn: params.alpn ? split(urldecode(params.alpn), ',') : null,
 			};
@@ -754,7 +757,7 @@ function parse_uri(uri) {
 		case 'vless':
 			/* https://github.com/XTLS/Xray-core/discussions/716 */
 			url = parseURL('http://' + uri[1]) || {};
-			params = url.searchParams;
+			params = url.searchParams || {};
 
 			/* Unsupported protocol */
 			if (params.type === 'kcp') {
@@ -776,6 +779,7 @@ function parse_uri(uri) {
 				uuid: url.username,
 				transport: (params.type !== 'tcp') ? params.type : null,
 				tls: (params.security in ['tls', 'xtls', 'reality']) ? '1' : '0',
+				tls_insecure: (params.insecure === '1' || params.allowInsecure === '1') ? '1' : '0',
 				tls_sni: params.sni,
 				tls_alpn: params.alpn ? split(urldecode(params.alpn), ',') : null,
 				tls_reality: (params.security === 'reality') ? '1' : '0',
