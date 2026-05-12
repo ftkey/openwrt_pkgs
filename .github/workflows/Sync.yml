@@ -80,7 +80,7 @@ jobs:
           #sync_repo luci-theme-argon-pkgs/luci-theme-argon https://github.com/jerrykuku/luci-theme-argon.git "" "master"
           #sync_repo luci-theme-argon-pkgs/luci-app-argon-config https://github.com/jerrykuku/luci-app-argon-config.git "" "master"
           sync_repo luci-app-onliner https://github.com/ftkey/luci-app-onliner.git ""
-          sync_repo ddns-scripts-aliyun https://github.com/sbwml/openwrt_pkgs.git ddns-scripts-aliyun
+          #sync_repo ddns-scripts-aliyun https://github.com/sbwml/openwrt_pkgs.git ddns-scripts-aliyun
           sync_repo luci-theme-design https://github.com/coolsnowwolf/luci.git "themes/luci-theme-design"  "openwrt-23.05" 
           sync_repo luci-app-openlist2-pkgs https://github.com/sbwml/luci-app-openlist2.git "luci-app-openlist2,openlist2"
 
