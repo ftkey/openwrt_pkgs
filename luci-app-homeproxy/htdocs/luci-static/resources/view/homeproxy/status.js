@@ -157,7 +157,7 @@ function getConnectionStatus() {
 
 	const view = E('div', { 'class': 'cbi-map' }, [
 		E('h3', { 'name': 'content', 'style': 'align-items:center;display:flex' }, [
-			_('Connection status'),
+			_('Connection Status'),
 			testButton
 		]),
 		E('div', { 'class': 'cbi-section' }, [ table ])
@@ -177,12 +177,12 @@ const resources = [
 		name: _('China IPv6 list')
 	},
 	{
-		type: 'china_list',
-		name: _('China domain list')
+		type: 'geosite_cn',
+		name: _('China domain rule set')
 	},
 	{
-		type: 'gfw_list',
-		name: _('GFW domain list')
+		type: 'dashboard',
+		name: _('Dashboard')
 	}
 ];
 
@@ -232,7 +232,7 @@ function getResources(o) {
 
 		return E('div', { 'class': 'cbi-map' }, [
 			E('h3', { 'name': 'content', 'style': 'align-items:center;display:flex' }, [
-				_('Resources management'),
+				_('Resource Management'),
 				E('button', {
 					'class': 'btn cbi-button cbi-button-action',
 					'style': 'margin-left:4px',
@@ -240,24 +240,33 @@ function getResources(o) {
 						return L.resolveDefault(callResUpdate(), {}).then((res) => {
 							let message, severity = 'info';
 
-							switch (res.status) {
-							case 0:
-								message = _('Successfully updated.');
-								break;
-							case 1:
-								message = _('Update failed.');
+							if (res.apply_failed) {
+								message = _('Resources were updated, but HomeProxy failed to reload. Check the log for details.');
 								severity = 'error';
-								break;
-							case 2:
-								message = _('Already in updating.');
-								break;
-							case 3:
-								message = _('Already at the latest version.');
-								break;
-							default:
-								message = _('Unknown error.');
-								severity = 'error';
-								break;
+							} else {
+								switch (res.status) {
+								case 0:
+									message = _('Successfully updated.');
+									break;
+								case 1:
+									message = _('Update failed.');
+									severity = 'error';
+									break;
+								case 2:
+									message = _('Update already in progress.');
+									break;
+								case 3:
+									message = _('Already at the latest version.');
+									break;
+								case 4:
+									message = _('Some resources failed to update. Check the log for details.');
+									severity = 'warning';
+									break;
+								default:
+									message = _('Unknown error.');
+									severity = 'error';
+									break;
+								}
 							}
 
 							ui.addNotification(null, E('p', message), severity);
@@ -350,7 +359,7 @@ function getRuntimeLog(o, name, _option_index, section_id, _in_table) {
 				]);
 			else
 				log = E('pre', { 'wrap': 'pre' }, [
-					_('Unknown error: %s').format(err)
+					_('Unknown error: %s.').format(err)
 				]);
 
 			dom.content(log_textarea, log);
@@ -361,7 +370,7 @@ function getRuntimeLog(o, name, _option_index, section_id, _in_table) {
 		E('style', [ css ]),
 		E('div', {'class': 'cbi-map'}, [
 			E('h3', {'name': 'content', 'style': 'align-items: center; display: flex;'}, [
-				_('%s log').format(name),
+				_('%s Log').format(name),
 				log_level_el || '',
 				E('button', {
 					'class': 'btn cbi-button cbi-button-action',
@@ -396,24 +405,6 @@ return view.extend({
 		o = s.option(form.DummyValue, '_resources');
 		o.render = L.bind(getResources, this, o);
 
-		o = s.option(form.Value, 'github_token', _('GitHub token'));
-		o.password = true;
-		o.renderWidget = function() {
-			let node = form.Value.prototype.renderWidget.apply(this, arguments);
-
-			(node.querySelector('.control-group') || node).appendChild(E('button', {
-				'class': 'cbi-button cbi-button-apply',
-				'title': _('Save'),
-				'click': ui.createHandlerFn(this, () => {
-					return this.map.save(null, true).then(() => {
-						ui.changes.apply(true);
-					});
-				}, this.option)
-			}, [ _('Save') ]));
-
-			return node;
-		}
-
 		s = m.section(form.NamedSection, 'config', 'homeproxy');
 		s.anonymous = true;
 
@@ -421,10 +412,10 @@ return view.extend({
 		o.render = L.bind(getRuntimeLog, this, o, _('HomeProxy'));
 
 		o = s.option(form.DummyValue, '_sing-box-c_logview');
-		o.render = L.bind(getRuntimeLog, this, o, _('sing-box client'));
+		o.render = L.bind(getRuntimeLog, this, o, _('sing-box Client'));
 
 		o = s.option(form.DummyValue, '_sing-box-s_logview');
-		o.render = L.bind(getRuntimeLog, this, o, _('sing-box server'));
+		o.render = L.bind(getRuntimeLog, this, o, _('sing-box Server'));
 
 		return m.render();
 	},

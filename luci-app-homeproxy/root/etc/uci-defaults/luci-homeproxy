@@ -1,9 +1,11 @@
 #!/bin/sh
 
-[ -f "/www/luci-static/resources/icons/loading.gif" ] && \
-	sed -i "s,/loading.svg,/loading.gif,g" "/www/luci-static/resources/view/homeproxy/status.js"
+if ! /usr/libexec/homeproxy-runtime-init; then
+	printf '%s\n' 'HomeProxy: failed to initialize runtime ports.' >&2
+	exit 1
+fi
 
-uci -q batch <<-EOF >"/dev/null"
+if ! uci -q batch <<-EOF >"/dev/null"
 	delete firewall.homeproxy_pre
 
 	delete firewall.homeproxy_forward
@@ -27,5 +29,15 @@ uci -q batch <<-EOF >"/dev/null"
 	set firewall.homeproxy_post.position="table-post"
 	commit firewall
 EOF
+then
+	printf '%s\n' 'HomeProxy: failed to configure firewall includes.' >&2
+	exit 1
+fi
 
+rm -rf /tmp/luci-*
+rm -f /etc/homeproxy/dashboard/.etag
+[ ! -d /etc/homeproxy/dashboard ] || chmod -R a+rX /etc/homeproxy/dashboard
+[ ! -f /var/run/homeproxy/sing-box-c.json ] || \
+	/etc/init.d/homeproxy restart >/dev/null 2>&1 || \
+	printf '%s\n' 'HomeProxy: failed to restart the running service after upgrade.' >&2
 exit 0

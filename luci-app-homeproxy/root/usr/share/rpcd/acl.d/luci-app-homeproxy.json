@@ -9,9 +9,9 @@
 			},
 			"ubus": {
 				"service": [ "list" ],
-					"luci.homeproxy": [
-						"acllist_read", "connection_check", "current_node_get",
-						"node_latency_test", "resources_get",
+				"luci.homeproxy": [
+					"acllist_read", "connection_check", "current_node_get",
+					"node_latency_test", "resources_get",
 					"singbox_generator", "singbox_get_features"
 				]
 			},

@@ -17,7 +17,7 @@ import { init_action } from 'luci.sys';
 
 import {
 	wGET, decodeBase64Str, getTime, isEmpty, parseURL,
-	shellQuote, validation, HP_DIR, RUN_DIR
+	reconcileUrltestNodes, shellQuote, validation, HP_DIR, RUN_DIR
 } from 'homeproxy';
 
 /* UCI config start */
@@ -26,7 +26,8 @@ const uci = cursor();
 const uciconfig = 'homeproxy';
 uci.load(uciconfig);
 
-const ucimain = 'config',
+const uciinfra = 'infra',
+      ucimain = 'config',
       ucinode = 'node',
       ucisubscription = 'subscription';
 
@@ -37,36 +38,17 @@ const allow_insecure = uci.get(uciconfig, ucisubscription, 'allow_insecure') || 
       subscription_urls = uci.get(uciconfig, ucisubscription, 'subscription_url') || [],
       user_agent = uci.get(uciconfig, ucisubscription, 'user_agent'),
       via_proxy = uci.get(uciconfig, ucisubscription, 'update_via_proxy') || '0';
+const resources_updated = getenv('HOMEPROXY_RESOURCES_UPDATED') === '1';
+const mixed_port = int(uci.get(uciconfig, uciinfra, 'mixed_port')) || 5330;
+const update_proxy = (via_proxy === '1') ? `http://127.0.0.1:${mixed_port}` : null;
+const service_running = system('/etc/init.d/homeproxy running >/dev/null 2>&1') === 0;
 
-const routing_mode = uci.get(uciconfig, ucimain, 'routing_mode') || 'bypass_mainland_china';
-let main_node, main_udp_node;
-if (routing_mode !== 'custom') {
-	main_node = uci.get(uciconfig, ucimain, 'main_node') || 'nil';
-	main_udp_node = uci.get(uciconfig, ucimain, 'main_udp_node') || 'nil';
-}
 /* UCI config end */
-
-/* String helper start */
-function filter_check(name) {
-	if (isEmpty(name) || filter_mode === 'disabled' || isEmpty(filter_keywords))
-		return false;
-
-	let ret = false;
-	for (let i in filter_keywords) {
-		const patten = regexp(i);
-		if (match(name, patten))
-			ret = true;
-	}
-	if (filter_mode === 'whitelist')
-		ret = !ret;
-
-	return ret;
-}
-/* String helper end */
 
 /* Common var start */
 const node_cache = {},
-      node_result = [];
+      node_result = [],
+      reconcile_group = {};
 
 const ubus = connect();
 const sing_features = ubus.call('luci.homeproxy', 'singbox_get_features', {}) || {};
@@ -76,18 +58,82 @@ const sing_features = ubus.call('luci.homeproxy', 'singbox_get_features', {}) ||
 system(`mkdir -p ${RUN_DIR}`);
 function log(...args) {
 	const logfile = open(`${RUN_DIR}/homeproxy.log`, 'a');
-	logfile.write(`${getTime()} [SUBSCRIBE] ${join(' ', args)}\n`);
+	if (!logfile)
+		return;
+
+	try {
+		logfile.write(`${getTime()} [SUBSCRIBE] ${join(' ', args)}\n`);
+	} catch (e) {
+		/* Logging must not abort subscription processing. */
+	}
 	logfile.close();
+}
+
+function log_error(prefix, error) {
+	const error_type = error?.type || 'Error';
+	const error_message = error?.message || sprintf('%s', error || 'unknown error');
+	const error_context = error?.stacktrace?.[0]?.context;
+
+	log(sprintf('%s: %s: %s', prefix, error_type, error_message));
+	if (error_context)
+		log(error_context);
+}
+
+/* String helper start */
+const invalid_filter_patterns = {};
+
+function filter_check(name) {
+	if (isEmpty(name) || filter_mode === 'disabled' || isEmpty(filter_keywords))
+		return false;
+
+	let ret = false;
+	for (let i in filter_keywords) {
+		let pattern;
+		try {
+			pattern = regexp(i);
+		} catch (e) {
+			if (!invalid_filter_patterns[i]) {
+				invalid_filter_patterns[i] = true;
+				log(sprintf('Ignoring invalid subscription filter pattern: %s.', i));
+			}
+			continue;
+		}
+		if (match(name, pattern))
+			ret = true;
+	}
+	if (filter_mode === 'whitelist')
+		ret = !ret;
+
+	return ret;
+}
+/* String helper end */
+
+function restart_service(message) {
+	if (!service_running)
+		return true;
+
+	log(message || 'Restarting service...');
+	if (init_action('homeproxy', 'restart') !== 0) {
+		log('Failed to restart HomeProxy; the updated configuration has not been applied.');
+		return false;
+	}
+
+	return true;
+}
+
+function apply_updated_resources() {
+	return !resources_updated || restart_service('Restarting service to apply updated resources...');
 }
 
 if (getenv('HOMEPROXY_SUBSCRIPTION_LOCKED') !== '1') {
 	const lock_path = `${RUN_DIR}/update_subscriptions.lock`;
 	const script_path = `${HP_DIR}/scripts/update_subscriptions.uc`;
-	const status = system(sprintf(
-		'HOMEPROXY_SUBSCRIPTION_LOCKED=1 flock -n %s %s',
+	const command = sprintf(
+		'exec 9>%s; flock -n 9 || exit 2; HOMEPROXY_SUBSCRIPTION_LOCKED=1 %s',
 		shellQuote(lock_path), shellQuote(script_path)
-	));
-	if (status !== 0)
+	);
+	const status = system(`/bin/sh -c ${shellQuote(command)}`);
+	if (status === 2)
 		log('Subscription update did not complete; another task may be running.');
 	exit(status);
 }
@@ -106,6 +152,12 @@ function bool_to_uci(value) {
 	if (value === false)
 		return '0';
 	return null;
+}
+
+function values_equal(left, right) {
+	if (!has_value(left) && !has_value(right))
+		return true;
+	return sprintf('%J', left) === sprintf('%J', right);
 }
 
 function normalize_list(value) {
@@ -336,7 +388,6 @@ function parse_mihomo_proxy(proxy) {
 			address: proxy.server,
 			port: to_string(proxy.port),
 			hysteria_hopping_port: normalize_mihomo_ports(proxy.ports),
-			hysteria_protocol: proxy.protocol,
 			hysteria_auth_type: proxy['auth-str'] ? 'string' : (proxy.auth ? 'base64' : null),
 			hysteria_auth_payload: proxy['auth-str'] || proxy.auth,
 			hysteria_obfs_password: proxy.obfs,
@@ -599,7 +650,6 @@ function parse_uri(uri) {
 				address: url.hostname,
 				port: url.port,
 				hysteria_hopping_port: normalize_hysteria_hopping_port(params.mport),
-				hysteria_protocol: params.protocol || 'udp',
 				hysteria_auth_type: params.auth ? 'string' : null,
 				hysteria_auth_payload: params.auth,
 				hysteria_obfs_password: params.obfsParam,
@@ -644,7 +694,7 @@ function parse_uri(uri) {
 		case 'socks':
 		case 'socks4':
 		case 'socks4a':
-		case 'socsk5':
+		case 'socks5':
 		case 'socks5h':
 			url = parseURL('http://' + uri[1]) || {};
 
@@ -966,90 +1016,110 @@ function parse_mihomo_yaml(text) {
 }
 
 function main() {
-	if (via_proxy !== '1') {
-		log('Stopping service...');
-		init_action('homeproxy', 'stop');
-	}
-
-	for (let url in subscription_urls) {
-		url = replace(url, /#.*$/, '');
-		const groupHash = md5(url);
-		node_cache[groupHash] = {};
-
-		const res = wGET(url, user_agent);
-		if (isEmpty(res)) {
-			log(sprintf('Failed to fetch resources from %s.', url));
+	const seen_urls = {};
+	for (let configured_url in subscription_urls) {
+		const url = replace(configured_url, /#.*$/, '');
+		if (seen_urls[url]) {
+			log(sprintf('Skipping duplicate subscription URL: %s.', url));
 			continue;
 		}
+		seen_urls[url] = true;
+		const groupHash = md5(url);
+		node_cache[groupHash] = {};
+		reconcile_group[groupHash] = false;
 
-		let nodes;
 		try {
-			nodes = json(res).servers || json(res);
-
-			/* Shadowsocks SIP008 format */
-			if (nodes[0].server && nodes[0].method)
-				map(nodes, (_, i) => nodes[i].nodetype = 'sip008');
-		} catch(e) {
-			nodes = parse_mihomo_yaml(res);
-			if (isEmpty(nodes)) {
-				nodes = decodeBase64Str(res);
-				const decoded_nodes = parse_mihomo_yaml(nodes);
-				if (!isEmpty(decoded_nodes))
-					nodes = decoded_nodes;
-				else
-					nodes = nodes ? split(trim(replace(nodes, / /g, '_')), '\n') : [];
-			}
-		}
-
-		let count = 0;
-		for (let node in nodes) {
-			let config;
-			if (!isEmpty(node))
-				config = parse_uri(node);
-			if (isEmpty(config))
+			const res = wGET(url, user_agent, update_proxy);
+			if (isEmpty(res)) {
+				log(sprintf('Failed to fetch resources from %s.', url));
 				continue;
-
-			const label = config.label;
-			config.label = null;
-			const confHash = md5(sprintf('%J', config)),
-			      nameHash = md5(groupHash + ':' + label),
-			      legacyNameHash = md5(label);
-			config.label = label;
-
-			if (filter_check(config.label))
-				log(sprintf('Skipping blacklist node: %s.', config.label));
-			else if (node_cache[groupHash][confHash] || node_cache[groupHash][nameHash])
-				log(sprintf('Skipping duplicate node: %s.', config.label));
-			else {
-				if (config.tls === '1' && allow_insecure === '1')
-					config.tls_insecure = '1';
-				if (config.type in ['vless', 'vmess'] && isEmpty(config.packet_encoding))
-					config.packet_encoding = packet_encoding;
-
-				config.grouphash = groupHash;
-				push(node_result, []);
-				push(node_result[length(node_result)-1], config);
-				node_cache[groupHash][confHash] = config;
-				node_cache[groupHash][nameHash] = config;
-				node_cache[groupHash][legacyNameHash] = config;
-
-				count++;
 			}
-		}
 
-		if (count == 0)
-			log(sprintf('No valid node found in %s.', url));
-		else
-			log(sprintf('Successfully fetched %s nodes of total %s from %s.', count, length(nodes), url));
+			let nodes;
+			try {
+				nodes = json(res).servers || json(res);
+
+				/* Shadowsocks SIP008 format */
+				if (nodes[0].server && nodes[0].method)
+					map(nodes, (_, i) => nodes[i].nodetype = 'sip008');
+			} catch(e) {
+				nodes = parse_mihomo_yaml(res);
+				if (isEmpty(nodes)) {
+					nodes = decodeBase64Str(res);
+					const decoded_nodes = parse_mihomo_yaml(nodes);
+					if (!isEmpty(decoded_nodes))
+						nodes = decoded_nodes;
+					else
+						nodes = nodes ? split(trim(replace(nodes, / /g, '_')), '\n') : [];
+				}
+			}
+
+			let count = 0, parse_complete = true;
+			const label_occurrences = {};
+			for (let node in nodes) {
+				try {
+					let config;
+					if (!isEmpty(node))
+						config = parse_uri(node);
+					if (isEmpty(config))
+						continue;
+
+					const label = config.label;
+					config.label = null;
+					const confHash = md5(sprintf('%J', config));
+					config.label = label;
+
+					if (filter_check(config.label))
+						log(sprintf('Skipping blacklist node: %s.', config.label));
+					else if (node_cache[groupHash][confHash])
+						log(sprintf('Skipping duplicate node: %s.', config.label));
+					else {
+						const occurrence = (label_occurrences[label] || 0) + 1;
+						label_occurrences[label] = occurrence;
+						const nameHash = md5(groupHash + ':' + label +
+							(occurrence > 1 ? ':' + occurrence : ''));
+
+						if (node_cache[groupHash][nameHash]) {
+							log(sprintf('Skipping duplicate node: %s.', config.label));
+							continue;
+						}
+
+						if (config.tls === '1' && allow_insecure === '1')
+							config.tls_insecure = '1';
+						if (config.type in ['vless', 'vmess'] && isEmpty(config.packet_encoding))
+							config.packet_encoding = packet_encoding;
+
+						config.grouphash = groupHash;
+						config.__section_id = nameHash;
+						push(node_result, []);
+						push(node_result[length(node_result)-1], config);
+						node_cache[groupHash][confHash] = config;
+						node_cache[groupHash][nameHash] = config;
+
+						count++;
+					}
+				} catch (e) {
+					parse_complete = false;
+					log_error(sprintf('Skipping an invalid node from %s', url), e);
+				}
+			}
+			reconcile_group[groupHash] = parse_complete;
+
+			if (count == 0)
+				log(sprintf('No valid node found in %s.', url));
+			else
+				log(sprintf('Successfully fetched %s nodes of total %s from %s.', count, length(nodes), url));
+			if (!parse_complete)
+				log(sprintf('Preserving unmatched existing nodes from %s because part of the response could not be parsed.', url));
+		} catch (e) {
+			log_error(sprintf('Failed to process subscription %s', url), e);
+		}
 	}
 
 	if (isEmpty(node_result)) {
 		log('Failed to update subscriptions: no valid node found.');
 
-		if (via_proxy !== '1') {
-			log('Starting service...');
-			init_action('homeproxy', 'start');
-		}
+		apply_updated_resources();
 
 		return false;
 	}
@@ -1061,26 +1131,33 @@ function main() {
 			return null;
 
 		/* Empty object - failed to fetch nodes */
-		if (length(node_cache[cfg.grouphash]) === 0)
+		const cached_group = node_cache[cfg.grouphash];
+		if (!cached_group || length(cached_group) === 0 || reconcile_group[cfg.grouphash] !== true)
 			return null;
 
-		if (!node_cache[cfg.grouphash] || !node_cache[cfg.grouphash][cfg['.name']]) {
+		if (!cached_group[cfg['.name']]) {
 			uci.delete(uciconfig, cfg['.name']);
 			removed++;
 
 			log(sprintf('Removing node: %s.', cfg.label || cfg['.name']));
 		} else {
-			const next = node_cache[cfg.grouphash][cfg['.name']];
+			const next = cached_group[cfg['.name']];
+			let changed = false;
 			for (let option in keys(cfg))
-				if (!match(option, /^\./) && !(option in next))
+				if (!match(option, /^\./) && !(option in next)) {
 					uci.delete(uciconfig, cfg['.name'], option);
+					changed = true;
+				}
 
 			for (let option in keys(next))
-				if (option !== 'isExisting')
+				if (!match(option, /^__/) && option !== 'isExisting' && !values_equal(cfg[option], next[option])) {
 					uci.set(uciconfig, cfg['.name'], option, next[option]);
+					changed = true;
+				}
 
 			next.isExisting = true;
-			updated++;
+			if (changed)
+				updated++;
 		}
 	});
 
@@ -1089,72 +1166,39 @@ function main() {
 			if (node.isExisting)
 				return null;
 
-			const nameHash = md5(node.grouphash + ':' + node.label);
-			uci.set(uciconfig, nameHash, 'node');
-			map(keys(node), (v) => uci.set(uciconfig, nameHash, v, node[v]));
+			const nameHash = node.__section_id;
+			try {
+				uci.set(uciconfig, nameHash, 'node');
+				map(keys(node), (v) => {
+					if (!match(v, /^__/))
+						uci.set(uciconfig, nameHash, v, node[v]);
+				});
 
-			added++;
-			log(sprintf('Adding node: %s.', node.label));
+				added++;
+				log(sprintf('Adding node: %s.', node.label));
+			} catch (e) {
+				uci.delete(uciconfig, nameHash);
+				log_error(sprintf('Skipping node %s because it could not be saved', node.label), e);
+			}
 		});
 
-	if (!isEmpty(main_node)) {
+	reconcileUrltestNodes(uci, uciconfig, (message) => log(message));
+
+	const current_main_node = uci.get(uciconfig, ucimain, 'main_node') || 'nil';
+	if (current_main_node !== 'nil' && current_main_node !== 'urltest' &&
+	    uci.get(uciconfig, current_main_node) !== ucinode) {
 		const first_server = uci.get_first(uciconfig, ucinode);
-		if (first_server) {
-			let main_urltest_nodes;
-			if (main_node === 'urltest') {
-				main_urltest_nodes = filter(normalize_list(uci.get(uciconfig, ucimain, 'main_urltest_nodes')) || [], (v) => {
-					if (!uci.get(uciconfig, v)) {
-						log(sprintf('Node %s is gone, removing from urltest list.', v));
-						return false;
-					}
-					return true;
-				});
-				if (length(main_urltest_nodes))
-					uci.set(uciconfig, ucimain, 'main_urltest_nodes', main_urltest_nodes);
-			}
-
-			if ((main_node === 'urltest') ? !length(main_urltest_nodes) : !uci.get(uciconfig, main_node)) {
-				uci.set(uciconfig, ucimain, 'main_node', first_server);
-				uci.delete(uciconfig, ucimain, 'main_urltest_nodes');
-
-				log('Main node is gone, switching to the first node.');
-			}
-
-			if (!isEmpty(main_udp_node) && main_udp_node !== 'same') {
-				let main_udp_urltest_nodes;
-				if (main_udp_node === 'urltest') {
-					main_udp_urltest_nodes = filter(normalize_list(uci.get(uciconfig, ucimain, 'main_udp_urltest_nodes')) || [], (v) => {
-						if (!uci.get(uciconfig, v)) {
-							log(sprintf('Node %s is gone, removing from urltest list.', v));
-							return false;
-						}
-						return true;
-					});
-					if (length(main_udp_urltest_nodes))
-						uci.set(uciconfig, ucimain, 'main_udp_urltest_nodes', main_udp_urltest_nodes);
-				}
-
-				if ((main_udp_node === 'urltest') ? !length(main_udp_urltest_nodes) : !uci.get(uciconfig, main_udp_node)) {
-					uci.set(uciconfig, ucimain, 'main_udp_node', first_server);
-					uci.delete(uciconfig, ucimain, 'main_udp_urltest_nodes');
-
-					log('Main UDP node is gone, switching to the first node.');
-				}
-			}
-		} else {
-			uci.set(uciconfig, ucimain, 'main_node', 'nil');
-			uci.set(uciconfig, ucimain, 'main_udp_node', 'nil');
-			uci.delete(uciconfig, ucimain, 'main_urltest_nodes');
-			uci.delete(uciconfig, ucimain, 'main_udp_urltest_nodes');
-
-			log('No available node, disable tproxy.');
-		}
+		uci.set(uciconfig, ucimain, 'main_node', first_server || 'nil');
+		if (first_server)
+			log('Main node is gone, switching to the first node.');
+		else
+			log('No available node, disabling the client.');
 	}
-	uci.commit(uciconfig);
-
-	log('Restarting service...');
-	init_action('homeproxy', 'stop');
-	init_action('homeproxy', 'start');
+	const config_changed = !isEmpty(uci.changes(uciconfig));
+	if (config_changed && uci.commit(uciconfig) !== true)
+		die('failed to commit subscription changes');
+	if ((config_changed || resources_updated) && !restart_service())
+		return false;
 
 	log(sprintf('%s nodes added, %s updated, %s removed.', added, updated, removed));
 	log('Successfully updated subscriptions.');
@@ -1162,13 +1206,10 @@ function main() {
 
 if (!isEmpty(subscription_urls))
 	try {
-		call(main);
+		if (call(main) === false)
+			exit(1);
 	} catch(e) {
-		log('[FATAL ERROR] An error occurred during updating subscriptions:');
-		log(sprintf('%s: %s', e.type, e.message));
-		log(e.stacktrace[0].context);
-
-		log('Restarting service...');
-		init_action('homeproxy', 'stop');
-		init_action('homeproxy', 'start');
+		log_error('[FATAL ERROR] An error occurred during updating subscriptions', e);
+		apply_updated_resources();
+		exit(1);
 	}

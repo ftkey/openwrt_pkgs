@@ -127,7 +127,7 @@ return view.extend({
 		let features = data[1];
 
 		m = new form.Map('homeproxy', _('HomeProxy Server'),
-			_('The modern ImmortalWrt proxy platform for ARM64/AMD64.'));
+			_('The modern ImmortalWrt proxy platform for ARM64/AMD64. — AI Edition'));
 
 		s = m.section(form.TypedSection);
 		s.render = function() {
@@ -143,7 +143,7 @@ return view.extend({
 			]);
 		}
 
-		s = m.section(form.NamedSection, 'server', 'homeproxy', _('Global settings'));
+		s = m.section(form.NamedSection, 'server', 'homeproxy', _('Global Settings'));
 
 		o = s.option(form.Flag, 'enabled', _('Enable'));
 		o.rmempty = false;
@@ -182,10 +182,10 @@ return view.extend({
 		}
 		o.value('mixed', _('Mixed'));
 		o.value('shadowsocks', _('Shadowsocks'));
-		o.value('socks', _('Socks'));
+		o.value('socks', _('SOCKS'));
 		o.value('trojan', _('Trojan'));
 		if (features.with_quic)
-			o.value('tuic', _('Tuic'));
+			o.value('tuic', _('TUIC'));
 		o.value('vless', _('VLESS'));
 		o.value('vmess', _('VMess'));
 		o.rmempty = false;
@@ -247,17 +247,6 @@ return view.extend({
 		o.modalonly = true;
 
 		/* Hysteria (2) config start */
-		o = s.option(form.ListValue, 'hysteria_protocol', _('Protocol'));
-		o.value('udp');
-		/* WeChat-Video / FakeTCP are unsupported by sing-box currently
-		   o.value('wechat-video');
-		   o.value('faketcp');
-		*/
-		o.default = 'udp';
-		o.depends('type', 'hysteria');
-		o.rmempty = false;
-		o.modalonly = true;
-
 		o = s.option(form.Value, 'hysteria_down_mbps', _('Max download speed'),
 			_('Max download speed in Mbps.'));
 		o.datatype = 'uinteger';
@@ -297,30 +286,34 @@ return view.extend({
 		o.depends({'type': 'hysteria2', 'hysteria_obfs_type': /[\s\S]/});
 		o.modalonly = true;
 
-		o = s.option(form.Value, 'hysteria_recv_window_conn', _('QUIC stream receive window'),
+		o = s.option(form.Value, 'hysteria_stream_receive_window', _('QUIC stream receive window'),
 			_('The QUIC stream-level flow control window for receiving data.'));
 		o.datatype = 'uinteger';
 		o.default = '67108864';
 		o.depends('type', 'hysteria');
+		o.depends('type', 'hysteria2');
 		o.modalonly = true;
 
-		o = s.option(form.Value, 'hysteria_recv_window_client', _('QUIC connection receive window'),
+		o = s.option(form.Value, 'hysteria_connection_receive_window', _('QUIC connection receive window'),
 			_('The QUIC connection-level flow control window for receiving data.'));
 		o.datatype = 'uinteger';
 		o.default = '15728640';
 		o.depends('type', 'hysteria');
+		o.depends('type', 'hysteria2');
 		o.modalonly = true;
 
-		o = s.option(form.Value, 'hysteria_max_conn_client', _('QUIC maximum concurrent bidirectional streams'),
+		o = s.option(form.Value, 'hysteria_max_concurrent_streams', _('QUIC maximum concurrent bidirectional streams'),
 			_('The maximum number of QUIC concurrent bidirectional streams that a peer is allowed to open.'));
 		o.datatype = 'uinteger';
 		o.default = '1024';
 		o.depends('type', 'hysteria');
+		o.depends('type', 'hysteria2');
 		o.modalonly = true;
 
-		o = s.option(form.Flag, 'hysteria_disable_mtu_discovery', _('Disable Path MTU discovery'),
+		o = s.option(form.Flag, 'hysteria_disable_path_mtu_discovery', _('Disable path MTU discovery'),
 			_('Disables Path MTU Discovery (RFC 8899). Packets will then be at most 1252 (IPv4) / 1232 (IPv6) bytes in size.'));
 		o.depends('type', 'hysteria');
+		o.depends('type', 'hysteria2');
 		o.modalonly = true;
 
 		o = s.option(form.Flag, 'hysteria_ignore_client_bandwidth', _('Ignore client bandwidth'),
@@ -342,7 +335,7 @@ return view.extend({
 		o.depends('type', 'shadowsocks');
 		o.modalonly = true;
 
-		/* Tuic config start */
+		/* TUIC config start */
 		o = s.option(CBIGenValue, 'uuid', _('UUID'));
 		o.password = true;
 		o.depends('type', 'tuic');
@@ -379,7 +372,7 @@ return view.extend({
 		o.default = '10';
 		o.depends('type', 'tuic');
 		o.modalonly = true;
-		/* Tuic config end */
+		/* TUIC config end */
 
 		/* VLESS / VMess config start */
 		o = s.option(form.ListValue, 'vless_flow', _('Flow'));
@@ -510,7 +503,7 @@ return view.extend({
 
 		if (features.hp_has_tcp_brutal) {
 			o = s.option(form.Flag, 'multiplex_brutal', _('Enable TCP Brutal'),
-				_('Enable TCP Brutal congestion control algorithm'));
+				_('Enable TCP Brutal congestion control algorithm.'));
 			o.depends('multiplex', '1');
 			o.modalonly = true;
 
@@ -543,9 +536,11 @@ return view.extend({
 		o.validate = function(section_id, value) {
 			if (section_id) {
 				let type = this.map.lookupOption('type', section_id)[0].formvalue(section_id);
+				let transport_options = this.map.lookupOption('transport', section_id);
+				let transport = transport_options?.[0]?.formvalue(section_id);
 				let tls = this.map.findElement('id', 'cbid.homeproxy.%s.tls'.format(section_id)).firstElementChild;
 
-				if (['hysteria', 'hysteria2', 'tuic'].includes(type)) {
+				if (['hysteria', 'hysteria2', 'tuic'].includes(type) || transport === 'quic') {
 					tls.checked = true;
 					tls.disabled = true;
 				} else {
@@ -687,7 +682,7 @@ return view.extend({
 			o.depends('tls_dns01_challenge', '0');
 			o.modalonly = true;
 
-			o = s.option(form.Flag, 'tls_acme_external_account', _('External Account Binding'),
+			o = s.option(form.Flag, 'tls_acme_external_account', _('External account binding'),
 				_('EAB (External Account Binding) contains information necessary to bind or map an ACME account to some other account known by the CA.' +
 				'<br/>External account bindings are "used to associate an ACME account with an existing account in a non-ACME system, such as a CA customer database.'));
 			o.depends('tls_acme', '1');
@@ -847,11 +842,11 @@ return view.extend({
 		o.depends({'network': 'udp', '!reverse': true});
 		o.modalonly = true;
 
-		o = s.option(form.Flag, 'tcp_multi_path', _('MultiPath TCP'));
+		o = s.option(form.Flag, 'tcp_multi_path', _('TCP multi-path'));
 		o.depends({'network': 'udp', '!reverse': true});
 		o.modalonly = true;
 
-		o = s.option(form.Flag, 'udp_fragment', _('UDP Fragment'),
+		o = s.option(form.Flag, 'udp_fragment', _('UDP fragment'),
 			_('Enable UDP fragmentation.'));
 		o.depends({'network': 'tcp', '!reverse': true});
 		o.modalonly = true;

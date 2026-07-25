@@ -7,7 +7,7 @@
 
 'use strict';
 
-import { access, lstat, popen, readfile, writefile } from 'fs';
+import { lstat, open, popen, readfile, writefile } from 'fs';
 import { cursor } from 'uci';
 
 import {
@@ -25,11 +25,23 @@ function hasKernelModule(kmod) {
 
 const HP_DIR = '/etc/homeproxy';
 const RUN_DIR = '/var/run/homeproxy';
-const RESOURCE_SOURCES = {
-	china_ip4: 'https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/cncidr.txt',
-	china_ip6: 'https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/cncidr.txt',
-	china_list: 'https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/direct.txt',
-	gfw_list: 'https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/gfw.txt'
+const RESOURCES = {
+	china_ip4: {
+		source: 'https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/cncidr.txt',
+		version: `${HP_DIR}/resources/china_ip4.ver`
+	},
+	china_ip6: {
+		source: 'https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/cncidr.txt',
+		version: `${HP_DIR}/resources/china_ip6.ver`
+	},
+	geosite_cn: {
+		source: 'https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set-unstable/geosite-cn.srs',
+		version: `${HP_DIR}/resources/geosite_cn.ver`
+	},
+	dashboard: {
+		source: 'https://codeload.github.com/SagerNet/sing-box-dashboard/zip/refs/heads/gh-pages',
+		version: `${HP_DIR}/dashboard/dashboard.ver`
+	}
 };
 const CONNECTION_SITES = {
 	baidu: 'https://www.baidu.com/',
@@ -68,16 +80,9 @@ const methods = {
 					content += '\n';
 			}
 
-			if (system(`mkdir -p ${HP_DIR}/resources`) !== 0)
-				return { result: false, error: 'failed to prepare resources directory' };
-
-			const tmpfile = file + '.tmp';
-			if (writefile(tmpfile, content) === null)
+			system(`mkdir -p ${HP_DIR}/resources`);
+			if (writefile(file, content) === null)
 				return { result: false, error: 'failed to write domain list' };
-			if (system(`mv -f ${tmpfile} ${file}`) !== 0) {
-				system(`rm -f ${tmpfile}`);
-				return { result: false, error: 'failed to replace domain list' };
-			}
 
 			return { result: true };
 		}
@@ -91,33 +96,68 @@ const methods = {
 				const filestat = lstat(tmpcert);
 
 				if (!filestat || filestat.type !== 'file' || filestat.size <= 0) {
-					system(`rm -f ${tmpcert}`);
+					system(`/bin/rm -f ${shellquote(tmpcert)}`);
 					return { result: false, error: 'empty certificate file' };
 				}
 
 				let filecontent = readfile(tmpcert);
 				if (is_binary(filecontent)) {
-					system(`rm -f ${tmpcert}`);
+					system(`/bin/rm -f ${shellquote(tmpcert)}`);
 					return { result: false, error: 'illegal file type: binary' };
 				}
 
-				/* Kanged from luci-proto-openconnect */
-				const beg = (kind === 'private') ? /^-----BEGIN (RSA|EC) PRIVATE KEY-----$/ :
-				            ((kind === 'ech') ? /^-----BEGIN ECH CONFIGS-----$/ : /^-----BEGIN CERTIFICATE-----$/),
-				      end = (kind === 'private') ? /^-----END (RSA|EC) PRIVATE KEY-----$/ :
-				            ((kind === 'ech') ? /^-----END ECH CONFIGS-----$/ : /^-----END CERTIFICATE-----$/),
-				      lines = split(trim(filecontent), /[\r\n]/);
-				let start = false, i;
+				const allowed = (kind === 'private') ?
+				      [ 'RSA PRIVATE KEY', 'EC PRIVATE KEY', 'PRIVATE KEY' ] :
+				      ((kind === 'ech') ? [ 'ECH CONFIGS' ] : [ 'CERTIFICATE' ]),
+				      multiple = kind === 'certificate',
+				      normalized = replace(trim(filecontent), /\r\n?/g, '\n'),
+				      lines = split(normalized, '\n');
+				let current, payload = '', blocks = 0, valid = true;
 
-				for (i = 0; i < length(lines); i++) {
-					if (match(lines[i], beg))
-						start = true;
-					else if (start && !b64dec(lines[i]) && length(lines[i]) !== 64)
+				for (let line in lines) {
+					if (!current) {
+						if (!line)
+							continue;
+
+						const begin = match(line, /^-----BEGIN (.+)-----$/);
+						if (!begin || !(begin[1] in allowed)) {
+							valid = false;
+							break;
+						}
+
+						current = begin[1];
+						payload = '';
+						continue;
+					}
+
+					if (line === `-----END ${current}-----`) {
+						let decoded;
+						try {
+							decoded = payload ? b64dec(payload) : null;
+						} catch (e) {
+							decoded = null;
+						}
+
+						if (!decoded) {
+							valid = false;
+							break;
+						}
+
+						current = null;
+						payload = '';
+						blocks++;
+						continue;
+					}
+
+					if (!line || match(line, /^-----/) || !match(line, /^[A-Za-z0-9+\/]+={0,2}$/)) {
+						valid = false;
 						break;
+					}
+					payload += line;
 				}
 
-				if (!start || i < length(lines) - 1 || !match(lines[i], end)) {
-					system(`rm -f ${tmpcert}`);
+				if (!valid || current || blocks === 0 || (!multiple && blocks !== 1)) {
+					system(`/bin/rm -f ${shellquote(tmpcert)}`);
 					return { result: false, error: 'this does not look like a correct PEM file' };
 				}
 
@@ -127,12 +167,17 @@ const methods = {
 				if (!match(filecontent, /\n$/))
 					filecontent += '\n';
 
-				system(`mkdir -p ${HP_DIR}/certs`);
 				const certfile = `${HP_DIR}/certs/${filename}.pem`;
-				writefile(certfile, filecontent);
-				if (kind === 'private')
-					system(`chmod 600 ${certfile}`);
-				system(`rm -f ${tmpcert}`);
+				system(`/bin/mkdir -p ${shellquote(HP_DIR + '/certs')}`);
+				if (writefile(certfile, filecontent) === null) {
+					system(`/bin/rm -f ${shellquote(tmpcert)}`);
+					return { result: false, error: 'failed to write certificate file' };
+				}
+				if (kind === 'private' && system(`/bin/chmod 600 ${shellquote(certfile)}`) !== 0) {
+					system(`/bin/rm -f ${shellquote(tmpcert)} ${shellquote(certfile)}`);
+					return { result: false, error: 'failed to protect private key file' };
+				}
+				system(`/bin/rm -f ${shellquote(tmpcert)}`);
 
 				return { result: true };
 			};
@@ -142,16 +187,12 @@ const methods = {
 			case 'client_ca':
 			case 'server_publickey':
 				return writeCertificate(filename, 'certificate');
-				break;
 			case 'client_ech_conf':
 				return writeCertificate(filename, 'ech');
-				break;
 			case 'server_privatekey':
 				return writeCertificate(filename, 'private');
-				break;
 			default:
-				return { result: false, error: 'illegal cerificate filename' };
-				break;
+				return { result: false, error: 'illegal certificate filename' };
 			}
 		}
 	},
@@ -222,6 +263,9 @@ const methods = {
 		call: function() {
 			const uci = cursor();
 			uci.load('homeproxy');
+			const routing_mode = uci.get('homeproxy', 'config', 'routing_mode') || 'bypass_mainland_china';
+			if (routing_mode === 'custom')
+				return { mode: 'custom', active: null, error: null };
 
 			const formatNode = (section_id, fallback_name) => {
 				if (!section_id || section_id in ['nil', 'same'])
@@ -249,7 +293,14 @@ const methods = {
 					error: null
 				};
 
-			const fd = popen('/usr/bin/wget -qO- http://127.0.0.1:9090/proxies/main-out 2>"/dev/null"');
+			const clash_api_port = int(uci.get('homeproxy', 'infra', 'clash_api_port'));
+			if (!clash_api_port)
+				return {
+					mode: 'urltest',
+					active: { id: 'urltest', label: 'URLTest', type: 'urltest' },
+					error: 'clash_api_unavailable'
+				};
+			const fd = popen(`/usr/bin/curl -fsS --connect-timeout 1 --max-time 2 http://127.0.0.1:${clash_api_port}/proxies/main-out 2>"/dev/null"`);
 			if (!fd)
 				return {
 					mode: 'urltest',
@@ -287,270 +338,96 @@ const methods = {
 	},
 
 	node_latency_test: {
-		args: { node: 'node', mode: 'mode' },
+		args: { nodes: [] },
 		call: function(req) {
 			const error_codes = {
 				invalid_node: 'invalid_node',
-				invalid_mode: 'invalid_mode',
-				mode_mismatch: 'mode_mismatch',
-				rp_invalid_outbound: 'rp_invalid_outbound',
-				rp_runtime_prepare_failed: 'rp_runtime_prepare_failed',
-				rp_runtime_launch_failed: 'rp_runtime_launch_failed',
-				rp_runtime_timeout: 'rp_runtime_timeout',
-				rp_delay_timeout: 'rp_delay_timeout',
-				rp_delay_failed: 'rp_delay_failed',
-				icmp_probe_unavailable: 'icmp_probe_unavailable',
-				icmp_timeout: 'icmp_timeout',
-				icmp_failed: 'icmp_failed',
-				probe_timeout: 'probe_timeout',
-				backend_execution_failed: 'backend_execution_failed',
-				probe_failed: 'probe_failed'
+				invalid_outbound: 'invalid_outbound',
+				runtime_prepare_failed: 'runtime_prepare_failed',
+				runtime_launch_failed: 'runtime_launch_failed',
+				runtime_timeout: 'runtime_timeout',
+				delay_timeout: 'delay_timeout',
+				delay_failed: 'delay_failed',
+				backend_execution_failed: 'backend_execution_failed'
 			};
-			const probe_timeout_s = 3;
-			const probe_timeout_ms = probe_timeout_s * 1000;
-			const probe_system_timeout_ms = probe_timeout_ms + 250;
-			const rp_probe_url = 'https://cp.cloudflare.com/generate_204';
-			const rp_probe_url_encoded = 'https%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204';
-			const rp_delay_timeout_ms = 5000;
+			const probe_url_encoded = 'https%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204';
+			const delay_timeout_ms = 5000;
+			const probe_parallelism = 16;
+			const hpuci = cursor();
+			hpuci.load('homeproxy');
+			const reserved_controller_port = int(hpuci.get('homeproxy', 'infra', 'clash_api_port')) || 0;
 
-			const formatResult = (node, state, latency_ms, err, extras) => ({
+			const formatResult = (node, state, latency_ms, err) => ({
 				node,
 				state,
 				latency_ms,
 				measured_at: time(),
-				error: err,
-				icmp_latency_ms: (extras && extras.icmp_latency_ms != null) ? extras.icmp_latency_ms : null,
-				icmp_error: (extras && extras.icmp_error) ? extras.icmp_error : null,
-				rp_runtime: (extras && extras.rp_runtime) ? extras.rp_runtime : null
+				error: err
 			});
 
-			const isControllerPortBusy = (port) => {
-				const hex_port = sprintf('%04X', int(port));
-				const tcp_v4 = readfile('/proc/net/tcp') || '';
-				const tcp_v6 = readfile('/proc/net/tcp6') || '';
-
-				for (let line in split(tcp_v4 + '\n' + tcp_v6, /\n/)) {
-					const fields = split(trim(line), /\s+/);
-					if (length(fields) < 4)
-						continue;
-
-					const local_addr = split(fields[1], ':');
-					const state = fields[3];
-					if (length(local_addr) !== 2)
-						continue;
-
-					if (local_addr[1] === hex_port && state === '0A')
-						return true;
-				}
-
-				return false;
-			};
-
-			const pickControllerPort = (seed) => {
-				const min_port = 19090;
-				const span = 100;
-				let hash_seed = 0;
-
-				for (let i = 0; i < length(seed); i++)
-					hash_seed += ord(seed, i);
-
-				const start = hash_seed % span;
-				for (let i = 0; i < span; i++) {
-					const candidate = min_port + ((start + i) % span);
-					if (candidate === 9090)
-						continue;
-					if (!isControllerPortBusy(candidate))
-						return candidate;
-				}
-
-				return null;
-			};
-
-			const listRuntimePidsByConfig = (config_path) => {
-				if (!config_path)
-					return [];
-
-				const scan_cmd = sprintf(
-					'/bin/sh -c %s -- %s',
-					shellquote('cfg="$1"; for proc in /proc/[0-9]*; do [ -d "$proc" ] || continue; pid="${proc#/proc/}"; [ -r "$proc/cmdline" ] || continue; found_cfg=0; has_sig=0; p1=""; p2=""; set -f; for arg in $(tr "\\000" "\\n" <"$proc/cmdline" 2>/dev/null); do [ "$arg" = "$cfg" ] && found_cfg=1; [ "${p2##*/}" = "sing-box" ] && [ "$p1" = "run" ] && [ "$arg" = "--config" ] && has_sig=1; p2="$p1"; p1="$arg"; done; set +f; [ "$has_sig" -eq 1 ] && [ "$found_cfg" -eq 1 ] && printf "%s\\n" "$pid"; done'),
-					shellquote(config_path)
-				);
-
-				const fd = popen(scan_cmd);
+			const readCommand = (command) => {
+				const fd = popen(command);
 				if (!fd)
-					return [];
-
-				let pids = [];
-				let line;
-				for (line = fd.read('line'); line !== null && line !== ''; line = fd.read('line')) {
-					const pid = trim(line);
-					if (match(pid, /^[0-9]+$/) && index(pids, pid) === -1)
-						push(pids, pid);
-				}
-				fd.close();
-
-				return pids;
-			};
-
-			const isRuntimeProcess = (pid, config_path) => {
-				if (!pid || !match(pid, /^[0-9]+$/) || !config_path)
-					return false;
-
-				if (system(`/bin/kill -0 ${shellquote(pid)} >/dev/null 2>&1`) !== 0)
-					return false;
-
-				return (index(listRuntimePidsByConfig(config_path), pid) !== -1);
-			};
-
-			const findRuntimePidByConfig = (config_path) => {
-				const pids = listRuntimePidsByConfig(config_path);
-				for (let i = 0; i < length(pids); i++) {
-					const pid = pids[i];
-					if (system(`/bin/kill -0 ${shellquote(pid)} >/dev/null 2>&1`) === 0)
-						return pid;
-				}
-
-				return null;
-			};
-
-			const resolveRuntimePid = (runtime_meta) => {
-				if (!runtime_meta?.config_path)
 					return null;
 
-				const pid_file = trim(readfile(runtime_meta.pid_path) || '');
-				if (isRuntimeProcess(pid_file, runtime_meta.config_path))
-					return pid_file;
-
-				const discovered = findRuntimePidByConfig(runtime_meta.config_path);
-				if (discovered)
-					writefile(runtime_meta.pid_path, discovered + '\n');
-
-				return discovered;
-			};
-
-			const cleanupProbeRuntime = (runtime_meta) => {
-				if (!runtime_meta)
-					return;
-
-				const terminateRuntimePid = (pid) => {
-					if (!pid)
-						return;
-
-					system(`/bin/kill ${shellquote(pid)} >/dev/null 2>&1`);
-					system('/bin/sleep 1');
-					if (system(`/bin/kill -0 ${shellquote(pid)} >/dev/null 2>&1`) === 0)
-						system(`/bin/kill -9 ${shellquote(pid)} >/dev/null 2>&1`);
-				};
-
-				let pid = resolveRuntimePid(runtime_meta);
-				while (pid) {
-					terminateRuntimePid(pid);
-					system(`/bin/rm -f ${shellquote(runtime_meta.pid_path)}`);
-					pid = findRuntimePidByConfig(runtime_meta.config_path);
+				let payload = '', line;
+				while (true) {
+					line = fd.read('line');
+					if (line === null || line === '')
+						break;
+					payload += line;
 				}
-
-				system(`/bin/rm -rf ${shellquote(runtime_meta.session_dir)}`);
+				fd.close();
+				return payload;
 			};
 
-			const waitControllerReady = (runtime_meta, timeout_ms) => {
-				try {
-					let retries = int((timeout_ms + 999) / 1000);
-					if (!retries || retries < 1)
-						retries = 1;
+			const getRuntimePid = (runtime_meta) => {
+				const pid = trim(readfile(runtime_meta?.pid_path) || '');
+				if (!match(pid, /^[0-9]+$/))
+					return null;
 
-					for (let i = 0; i < retries; i++) {
-						resolveRuntimePid(runtime_meta);
+				const cmdline = readfile(`/proc/${pid}/cmdline`) || '';
+				if (index(cmdline, 'sing-box') === -1 || index(cmdline, runtime_meta.config_path) === -1)
+					return null;
 
-						const probe_fd = popen(`/usr/bin/wget -qO- ${shellquote(runtime_meta.controller_url + '/version')} 2>"/dev/null"`);
-						if (probe_fd) {
-							let payload = '', line;
-							while (true) {
-								line = probe_fd.read('line');
-								if (line === null || line === '')
-									break;
-								payload += line;
-							}
-							probe_fd.close();
-							if (trim(payload))
-								return true;
-						}
-
-						if (i + 1 < retries)
-							system('/bin/sleep 1');
-					}
-
-					return false;
-				} catch (e) {
-					return false;
-				}
+				return pid;
 			};
 
-			const buildProbeRuntime = (node_name, node_cfg) => {
+			const buildProbeRuntime = (entries) => {
 				const runtime_root = RUN_DIR + '/latency-test';
-				const session_id = sprintf('%s-%d-%d', node_name, time(), int(readfile('/proc/uptime') || '0'));
+				const session_id = sprintf('%d-%d', time(), int(readfile('/proc/uptime') || '0'));
 				const session_dir = `${runtime_root}/${session_id}`;
 				const config_path = `${session_dir}/sing-box.json`;
-				const log_path = `${session_dir}/sing-box.log`;
-				const cache_path = `${session_dir}/cache.db`;
 				const pid_path = `${session_dir}/sing-box.pid`;
+				const port_output = readCommand(sprintf(
+					'/usr/libexec/homeproxy-random-port %s 2>"/dev/null"',
+					shellquote(reserved_controller_port)
+				));
+				const controller_port = int(trim(port_output || ''));
+				if (controller_port <= 0 || controller_port > 65535)
+					return { error: 'failed to allocate temporary controller port' };
 
-				const controller_port = pickControllerPort(node_name || 'real-proxy');
-				if (!controller_port)
-					return { error: 'no available temporary controller port' };
-
-				const selected_tag = 'probe-out';
 				const config = {
-					log: {
-						disabled: false,
-						level: 'warn',
-						output: log_path,
-						timestamp: true
-					},
+					log: { disabled: true },
 					dns: {
-						servers: [
-							{
-								type: 'local',
-								tag: 'local-dns'
-							}
-						]
+						servers: [{ type: 'local', tag: 'local-dns' }]
 					},
-					outbounds: [
-						{
-							type: 'direct',
-							tag: 'direct-out'
-						}
-					],
+					outbounds: [{ type: 'direct', tag: 'direct-out' }],
 					endpoints: [],
 					route: {
-						final: selected_tag,
+						final: 'direct-out',
 						auto_detect_interface: true,
 						default_domain_resolver: 'local-dns'
 					},
 					experimental: {
 						clash_api: {
 							external_controller: `127.0.0.1:${controller_port}`
-						},
-						cache_file: {
-							enabled: true,
-							path: cache_path
 						}
 					}
 				};
 
-				const rendered_outbound = (node_cfg.type === 'wireguard') ? renderEndpoint(node_cfg) : renderOutbound(node_cfg);
-				if (rendered_outbound && type(rendered_outbound) === 'object')
-					rendered_outbound.tag = selected_tag;
-
-				if (!rendered_outbound || type(rendered_outbound) !== 'object' || rendered_outbound.tag !== selected_tag || !rendered_outbound.type)
-					return {
-						error: 'failed to render temporary outbound for selected node',
-						code: error_codes.rp_invalid_outbound
-					};
-
-				if (node_cfg.type === 'wireguard')
-					push(config.endpoints, rendered_outbound);
-				else
-					push(config.outbounds, rendered_outbound);
+				for (let entry in entries)
+					push(entry.endpoint ? config.endpoints : config.outbounds, entry.outbound);
 
 				if (system(`/bin/mkdir -p ${shellquote(session_dir)}`) !== 0)
 					return { error: 'failed to prepare temporary runtime directory' };
@@ -561,11 +438,8 @@ const methods = {
 				}
 
 				return {
-					runtime_root,
 					session_dir,
 					config_path,
-					log_path,
-					cache_path,
 					pid_path,
 					controller_port,
 					controller_url: `http://127.0.0.1:${controller_port}`
@@ -573,336 +447,189 @@ const methods = {
 			};
 
 			const launchProbeRuntime = (runtime_meta) => {
-				if (!runtime_meta)
-					return false;
-
 				const launch_cmd = sprintf(
-					'/usr/bin/sing-box run --config %s >/dev/null 2>&1 & pid=$!; [ -n "$pid" ] && printf "%%s\\n" "$pid" > %s',
+					'/usr/bin/sing-box run --config %s >/dev/null 2>&1 & pid=$!; printf "%%s\\n" "$pid" > %s; /bin/kill -0 "$pid" >/dev/null 2>&1',
 					shellquote(runtime_meta.config_path),
 					shellquote(runtime_meta.pid_path)
 				);
 
-				if (system(`/bin/sh -c ${shellquote(launch_cmd)}`) !== 0)
-					return false;
+				return system(`/bin/sh -c ${shellquote(launch_cmd)}`) === 0;
+			};
 
-				for (let i = 0; i < 5; i++) {
-					const pid = resolveRuntimePid(runtime_meta);
-					if (pid)
-						return true;
+			const waitControllerReady = (runtime_meta) => {
+				for (let i = 0; i < 10; i++) {
+					if (getRuntimePid(runtime_meta)) {
+						const payload = readCommand(`/usr/bin/curl -fsS --connect-timeout 1 --max-time 1 ${shellquote(runtime_meta.controller_url + '/version')} 2>"/dev/null"`);
+						if (trim(payload || ''))
+							return true;
+					}
 
-					system('/bin/sleep 1');
+					if (i + 1 < 10)
+						sleep(200);
 				}
 
 				return false;
 			};
 
-			const monotonicMs = () => {
-				const uptime = trim(readfile('/proc/uptime') || '');
-				const parsed = match(uptime, /^([0-9]+)(\.([0-9]+))?/);
+			const cleanupProbeRuntime = (runtime_meta) => {
+				const pid = getRuntimePid(runtime_meta);
+				if (pid)
+					system(`/bin/kill ${shellquote(pid)} >/dev/null 2>&1`);
 
-				if (!parsed)
-					return null;
-
-				const sec = int(parsed[1]);
-				const frac = ((parsed[3] || '') + '000');
-				const msec = int(substr(frac, 0, 3));
-
-				return sec * 1000 + msec;
+				system(`/bin/rm -rf ${shellquote(runtime_meta.session_dir)}`);
 			};
 
-			const probeRealProxyDelay = (runtime_meta, node_name) => {
-				const selected_tag = 'probe-out';
-				const delay_endpoint = sprintf(
-					'%s/proxies/%s/delay?url=%s&timeout=%d',
-					runtime_meta.controller_url,
-					selected_tag,
-					rp_probe_url_encoded,
-					rp_delay_timeout_ms
-				);
-
-				const started_ms = monotonicMs();
-				const fd = popen(sprintf(
-					'/usr/bin/wget -qO- -T %d %s 2>"/dev/null"',
-					int((rp_delay_timeout_ms + 999) / 1000),
-					shellquote(delay_endpoint)
-				));
-				if (!fd)
-					return {
-						state: 'timeout',
-						error: {
-							code: error_codes.rp_delay_timeout,
-							message: 'failed to open temporary Clash API delay endpoint'
-						}
-					};
-
-				let payload = '', line;
-				while (true) {
-					line = fd.read('line');
-					if (line === null || line === '')
-						break;
-					payload += line;
-				}
-				fd.close();
-
-				const ended_ms = monotonicMs();
+			const parseDelayResponse = (entry) => {
+				const payload = readfile(entry.response_path);
 				if (!trim(payload || '')) {
-					if (started_ms !== null && ended_ms !== null && ended_ms - started_ms >= rp_delay_timeout_ms)
-						return {
-							state: 'timeout',
-							error: {
-								code: error_codes.rp_delay_timeout,
-								message: sprintf('temporary Clash API delay request timed out after %dms', rp_delay_timeout_ms)
-							}
-						};
-
-					return {
-						state: 'error',
-						error: {
-							code: error_codes.rp_delay_failed,
-							message: 'temporary Clash API delay response is empty'
-						}
-					};
+					return formatResult(entry.node, 'timeout', null, {
+						code: error_codes.delay_timeout,
+						message: sprintf('sing-box delay request timed out after %dms', delay_timeout_ms)
+					});
 				}
 
-				let data = null;
+				let data;
 				try {
 					data = json(payload);
 				} catch (e) {
-					return {
-						state: 'error',
-						error: {
-							code: error_codes.rp_delay_failed,
-							message: 'temporary Clash API delay response is not valid JSON'
-						}
-					};
+					return formatResult(entry.node, 'error', null, {
+						code: error_codes.delay_failed,
+						message: 'sing-box delay response is not valid JSON'
+					});
 				}
 
 				const delay_ms = int(data?.delay || '0');
 				if (delay_ms > 0)
-					return {
-						state: 'success',
-						latency_ms: delay_ms
-					};
+					return formatResult(entry.node, 'success', delay_ms, null);
 
-				const failure_msg = trim(sprintf('%s', data?.message || data?.error || '')) || 'temporary Clash API delay request failed';
-				if (match(failure_msg, /timeout/i) || (started_ms !== null && ended_ms !== null && ended_ms - started_ms >= rp_delay_timeout_ms))
-					return {
-						state: 'timeout',
-						error: {
-							code: error_codes.rp_delay_timeout,
-							message: failure_msg
-						}
-					};
-
-				return {
-					state: 'error',
-					error: {
-						code: error_codes.rp_delay_failed,
-						message: failure_msg
-					}
-				};
+				const message = trim(sprintf('%s', data?.message || data?.error || '')) || 'sing-box delay request failed';
+				return formatResult(entry.node, match(message, /timeout/i) ? 'timeout' : 'error', null, {
+					code: match(message, /timeout/i) ? error_codes.delay_timeout : error_codes.delay_failed,
+					message
+				});
 			};
 
-			const normalizeLatencyMode = (m) => (m === 'tcp') ? 'icmp' : m;
-			const node = trim(req.args?.node || '') || null;
-			const requested_mode = trim(req.args?.mode || '');
-			const mode = normalizeLatencyMode(requested_mode);
-			const allowed_modes = ['icmp', 'rp'];
-			const allowed_configured_modes = ['icmp', 'tcp', 'rp'];
-			if (!node)
-				return formatResult(null, 'error', null, {
-					code: error_codes.invalid_node,
-					message: 'missing node section id'
-				});
+			const probeDelays = (runtime_meta, entries) => {
+				let commands = [];
+				for (let i = 0; i < length(entries); i++) {
+					const entry = entries[i];
+					const delay_endpoint = sprintf(
+						'%s/proxies/%s/delay?url=%s&timeout=%d',
+						runtime_meta.controller_url,
+						entry.tag,
+						probe_url_encoded,
+						delay_timeout_ms
+					);
+					entry.response_path = `${runtime_meta.session_dir}/${entry.tag}.json`;
+					push(commands, sprintf(
+						'/usr/bin/curl -fsS --connect-timeout 1 --max-time %d -o %s %s 2>"/dev/null" &',
+						int((delay_timeout_ms + 999) / 1000),
+						shellquote(entry.response_path),
+						shellquote(delay_endpoint)
+					));
 
-			if (index(allowed_modes, mode) === -1)
-				return formatResult(node, 'error', null, {
-					code: error_codes.invalid_mode,
-					message: sprintf('invalid latency test mode: %s', mode || '(empty)')
-				});
-
-			const uci = cursor();
-			uci.load('homeproxy');
-
-			const configured_mode_raw = trim(uci.get('homeproxy', 'subscription', 'latency_test_mode') || '');
-			const configured_mode = normalizeLatencyMode(configured_mode_raw);
-			if (configured_mode_raw && index(allowed_configured_modes, configured_mode_raw) === -1)
-				return formatResult(node, 'error', null, {
-					code: error_codes.invalid_mode,
-					message: sprintf('configured latency test mode is invalid: %s', configured_mode_raw || '(empty)')
-				});
-
-			if (configured_mode && configured_mode !== mode)
-				return formatResult(node, 'error', null, {
-					code: error_codes.mode_mismatch,
-					message: sprintf('request mode %s does not match configured mode %s', mode, configured_mode)
-				});
-
-			const section = uci.get_all('homeproxy', node);
-			if (!section || section['.type'] !== 'node')
-				return formatResult(node, 'error', null, {
-					code: error_codes.invalid_node,
-					message: 'node section does not exist or is not a node section'
-				});
-
-			const address = trim(section.address || '');
-			const port = int(section.port || '0');
-			if (!address || port <= 0 || port > 65535)
-				return formatResult(node, 'error', null, {
-					code: error_codes.invalid_node,
-					message: 'node address or port is invalid'
-				});
-
-			if (mode === 'rp') {
-				let runtime_meta = null;
-				let runtime_active = false;
-				let runtime_info = {
-					runtime_root: RUN_DIR + '/latency-test',
-					session_dir: null,
-					config_path: null,
-					pid_path: null,
-					controller: null,
-					launched: false,
-					controller_ready: false,
-					cleaned_up: false
-				};
-
-				runtime_meta = buildProbeRuntime(node, section);
-				if (runtime_meta?.error)
-					runtime_info.cleaned_up = true;
-
-				if (runtime_meta?.error)
-					return formatResult(node, 'error', null, {
-						code: runtime_meta.code || error_codes.rp_runtime_prepare_failed,
-						message: runtime_meta.error
-					}, {
-						rp_runtime: runtime_info
-					});
-
-				runtime_info.session_dir = runtime_meta.session_dir;
-				runtime_info.config_path = runtime_meta.config_path;
-				runtime_info.pid_path = runtime_meta.pid_path;
-				runtime_info.controller = `127.0.0.1:${runtime_meta.controller_port}`;
-				runtime_active = true;
-
-				const finalizeRealProxyResult = (state, latency_ms, err) => {
-					if (runtime_active && runtime_meta) {
-						cleanupProbeRuntime(runtime_meta);
-						runtime_active = false;
-						runtime_info.cleaned_up = true;
+					if (length(commands) === probe_parallelism || i + 1 === length(entries)) {
+						system(`/bin/sh -c ${shellquote(join(' ', commands) + ' wait')}`);
+						commands = [];
 					}
-
-					return formatResult(node, state, latency_ms, err, {
-						rp_runtime: runtime_info
-					});
-				};
-
-				try {
-					if (!launchProbeRuntime(runtime_meta))
-						return finalizeRealProxyResult('error', null, {
-							code: error_codes.rp_runtime_launch_failed,
-							message: 'failed to launch temporary sing-box runtime'
-						});
-
-					runtime_info.launched = true;
-
-					if (!waitControllerReady(runtime_meta, rp_delay_timeout_ms))
-						return finalizeRealProxyResult('timeout', null, {
-							code: error_codes.rp_runtime_timeout,
-							message: 'temporary sing-box runtime controller did not become ready in time'
-						});
-
-					runtime_info.controller_ready = true;
-					const delay_result = probeRealProxyDelay(runtime_meta, node);
-					if (delay_result.state === 'success' && delay_result.latency_ms > 0)
-						return finalizeRealProxyResult('success', delay_result.latency_ms, null);
-
-					if (delay_result.state === 'timeout')
-						return finalizeRealProxyResult('timeout', null, delay_result.error || {
-							code: error_codes.rp_delay_timeout,
-							message: sprintf('temporary Clash API delay request timed out after %dms', rp_delay_timeout_ms)
-						});
-
-					return finalizeRealProxyResult('error', null, delay_result.error || {
-						code: error_codes.rp_delay_failed,
-						message: sprintf('temporary Clash API delay probe failed for %s', rp_probe_url)
-					});
-				} catch (e) {
-					return finalizeRealProxyResult('error', null, {
-						code: error_codes.backend_execution_failed,
-						message: 'unexpected backend error while handling temporary rp runtime'
-					});
 				}
-			}
 
-			const ping = access('/bin/ping') ? '/bin/ping' : (access('/usr/bin/ping') ? '/usr/bin/ping' : null);
-
-			const runProbe = (command, timeout_ms) => {
-				const started_ms = monotonicMs();
-				const probe_exit = system(command, timeout_ms);
-				const ended_ms = monotonicMs();
-				let latency_ms = null;
-				if (started_ms !== null && ended_ms !== null && ended_ms >= started_ms)
-					latency_ms = ended_ms - started_ms;
-				return { probe_exit, latency_ms };
+				for (let entry in entries)
+					entry.result = parseDelayResponse(entry);
 			};
 
-			let icmp_latency_ms = null;
-			let icmp_error = null;
+			let requested_nodes = req.args?.nodes;
+			if (type(requested_nodes) !== 'array')
+				requested_nodes = requested_nodes ? [requested_nodes] : [];
 
-			if (!ping) {
-				icmp_error = {
-					code: error_codes.icmp_probe_unavailable,
-					message: 'missing ping executable for ICMP probe'
-				};
+			let slots = [], entries = [], seen = {};
+			for (let value in requested_nodes) {
+				const node = trim(sprintf('%s', value || ''));
+				if (!node || seen[node])
+					continue;
+				seen[node] = true;
+
+				const section = hpuci.get_all('homeproxy', node);
+				if (!section || section['.type'] !== 'node') {
+					push(slots, {
+						result: formatResult(node, 'error', null, {
+							code: error_codes.invalid_node,
+							message: 'node section does not exist or is not a node section'
+						})
+					});
+					continue;
+				}
+
+				const endpoint = section.type === 'wireguard';
+				const outbound = endpoint ? renderEndpoint(section) : renderOutbound(section);
+				const tag = `probe-${length(entries)}`;
+				if (!outbound || type(outbound) !== 'object' || !outbound.type) {
+					push(slots, {
+						result: formatResult(node, 'error', null, {
+							code: error_codes.invalid_outbound,
+							message: 'failed to render sing-box outbound for node'
+						})
+					});
+					continue;
+				}
+
+				outbound.tag = tag;
+				const entry = { node, tag, endpoint, outbound };
+				push(slots, entry);
+				push(entries, entry);
 			}
-			else {
-				const result = runProbe(
-					`${ping} -c 1 -W ${probe_timeout_s} ${shellquote(address)} >/dev/null 2>/dev/null`,
-					probe_system_timeout_ms
-				);
 
-				if (result.probe_exit === 0)
-					icmp_latency_ms = (result.latency_ms !== null) ? result.latency_ms : 0;
-				else if (result.probe_exit === -1 || (result.latency_ms !== null && result.latency_ms >= probe_timeout_ms))
-					icmp_error = {
-						code: error_codes.icmp_timeout,
-						message: `ICMP ping timeout after ${probe_timeout_s}s`
-					};
-				else if (result.probe_exit === 127)
-					icmp_error = {
-						code: error_codes.backend_execution_failed,
-						message: 'ICMP ping command execution failed'
-					};
+			if (!length(entries))
+				return { results: map(slots, (slot) => slot.result) };
+
+			system(`/bin/mkdir -p ${shellquote(RUN_DIR)}`);
+			let lockfd = open(`${RUN_DIR}/latency-test.lock`, 'w', 0600);
+			if (!lockfd || lockfd.lock('x') !== true) {
+				lockfd?.close();
+				for (let entry in entries)
+					entry.result = formatResult(entry.node, 'error', null, {
+						code: error_codes.runtime_prepare_failed,
+						message: 'failed to lock temporary latency test runtime'
+					});
+				return { results: map(slots, (slot) => slot.result) };
+			}
+
+			const releaseLock = () => {
+				lockfd.lock('u');
+				lockfd.close();
+				lockfd = null;
+			};
+			const setPendingError = (state, code, message) => {
+				for (let entry in entries)
+					if (!entry.result)
+						entry.result = formatResult(entry.node, state, null, { code, message });
+			};
+
+			let runtime_meta = buildProbeRuntime(entries);
+			if (runtime_meta?.error) {
+				setPendingError('error', error_codes.runtime_prepare_failed, runtime_meta.error);
+				releaseLock();
+				return { results: map(slots, (slot) => slot.result) };
+			}
+
+			try {
+				if (!launchProbeRuntime(runtime_meta))
+					setPendingError('error', error_codes.runtime_launch_failed, 'failed to launch temporary sing-box runtime');
+				else if (!waitControllerReady(runtime_meta))
+					setPendingError('timeout', error_codes.runtime_timeout, 'temporary sing-box runtime did not become ready in time');
 				else
-					icmp_error = {
-						code: error_codes.icmp_failed,
-						message: `ICMP ping failed with exit code ${result.probe_exit}`
-					};
+					probeDelays(runtime_meta, entries);
+			} catch (e) {
+				setPendingError('error', error_codes.backend_execution_failed, 'unexpected backend error during latency test');
 			}
 
-			if (icmp_latency_ms !== null)
-				return formatResult(node, 'success', icmp_latency_ms, null, {
-					icmp_latency_ms,
-					icmp_error
-				});
+			cleanupProbeRuntime(runtime_meta);
+			releaseLock();
 
-			if (icmp_error?.code === error_codes.icmp_timeout)
-				return formatResult(node, 'timeout', null, {
-					code: error_codes.probe_timeout,
-					message: `ICMP probe timed out after ${probe_timeout_s}s`
-				}, {
-					icmp_latency_ms,
-					icmp_error
-				});
-
-			return formatResult(node, 'error', null, icmp_error || {
-				code: error_codes.probe_failed,
-				message: 'ICMP probe failed'
-			}, {
-				icmp_latency_ms,
-				icmp_error
-			});
+			return { results: map(slots, (slot) => slot.result || formatResult(slot.node, 'error', null, {
+				code: error_codes.backend_execution_failed,
+				message: 'latency test did not return a result'
+			})) };
 		}
 	},
 
@@ -913,8 +640,8 @@ const methods = {
 				return { result: false, error: 'illegal type' };
 
 			const filestat = lstat(`${RUN_DIR}/${req.args?.type}.log`);
-			if (filestat)
-				writefile(`${RUN_DIR}/${req.args?.type}.log`, '');
+			if (filestat && writefile(`${RUN_DIR}/${req.args?.type}.log`, '') === null)
+				return { result: false, error: 'failed to clean log file' };
 			return { result: true };
 		}
 	},
@@ -926,9 +653,10 @@ const methods = {
 				return { result: false, error: 'illegal type' };
 
 			const type = req.args?.type;
+			const params = trim(req.args?.params || '');
 			let result = {};
 
-			const fd = popen(`/usr/bin/sing-box generate ${type} ${shellquote(req.args?.params || '')}`);
+			const fd = popen(`/usr/bin/sing-box generate ${type}${params ? ' ' + shellquote(params) : ''}`);
 			if (fd) {
 				let ech_cfg_set = false;
 				let ech_key_set = false;
@@ -987,10 +715,7 @@ const methods = {
 				fd.close();
 			}
 
-			features.hp_has_ip_full = access('/usr/libexec/ip-full');
 			features.hp_has_tcp_brutal = hasKernelModule('brutal.ko');
-			features.hp_has_tproxy = hasKernelModule('nft_tproxy.ko') || access('/etc/modules.d/nft-tproxy');
-			features.hp_has_tun = hasKernelModule('tun.ko') || access('/etc/modules.d/30-tun');
 
 			return features;
 		}
@@ -999,12 +724,13 @@ const methods = {
 	resources_get: {
 		call: function() {
 			let resources = [];
-			for (let resource_type in keys(RESOURCE_SOURCES)) {
-				const version = trim(readfile(`${HP_DIR}/resources/${resource_type}.ver`) || '');
+			for (let resource_type in keys(RESOURCES)) {
+				const resource = RESOURCES[resource_type];
+				const version = trim(readfile(resource.version) || '');
 				push(resources, {
 					type: resource_type,
 					version: version || null,
-					source: RESOURCE_SOURCES[resource_type]
+					source: resource.source
 				});
 			}
 			return { resources };
@@ -1012,7 +738,33 @@ const methods = {
 	},
 	resources_update: {
 		call: function() {
-			return { status: system(`${HP_DIR}/scripts/update_resources.sh`) };
+			const hpuci = cursor();
+			hpuci.load('homeproxy');
+			const mixed_port = int(hpuci.get('homeproxy', 'infra', 'mixed_port')) || 5330;
+			const update_proxy = (hpuci.get('homeproxy', 'subscription', 'update_via_proxy') === '1') ?
+				`HOMEPROXY_UPDATE_PROXY=${shellquote(`http://127.0.0.1:${mixed_port}`)} ` : '';
+			const status = system(`${update_proxy}${HP_DIR}/scripts/update_resources.sh`);
+			let update_result = {};
+			if (status !== 2) {
+				for (let line in split(trim(readfile(`${RUN_DIR}/update_resources.result`) || ''), '\n')) {
+					const pair = match(line, /^([^=]+)=(.*)$/);
+					if (pair)
+						update_result[pair[1]] = pair[2];
+				}
+			}
+			const core_updated = update_result.core_updated === '1';
+			const dashboard_updated = update_result.dashboard_updated === '1';
+			let apply_failed = false;
+			if ((core_updated || dashboard_updated) && system('/etc/init.d/homeproxy running >/dev/null 2>&1') === 0)
+				apply_failed = system('/etc/init.d/homeproxy reload >/dev/null 2>&1') !== 0;
+			return {
+				status,
+				core_updated,
+				dashboard_updated,
+				apply_failed,
+				updated: update_result.updated || null,
+				failed: update_result.failed || null
+			};
 		}
 	}
 };

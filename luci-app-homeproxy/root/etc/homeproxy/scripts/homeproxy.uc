@@ -4,7 +4,7 @@
  * Copyright (C) 2023 ImmortalWrt.org
  */
 
-import { mkstemp } from 'fs';
+import { popen } from 'fs';
 import { urldecode_params } from 'luci.http';
 
 /* Global variables start */
@@ -26,32 +26,6 @@ export function isBinary(str) {
 	return false;
 };
 
-export function executeCommand(...args) {
-	let outfd = mkstemp();
-	let errfd = mkstemp();
-
-	const exitcode = system(`${join(' ', args)} >&${outfd.fileno()} 2>&${errfd.fileno()}`);
-
-	outfd.seek(0);
-	errfd.seek(0);
-
-	const stdout = outfd.read(1024 * 512) ?? '';
-	const stderr = errfd.read(1024 * 512) ?? '';
-
-	outfd.close();
-	errfd.close();
-
-	const binary = isBinary(stdout);
-
-	return {
-		command: join(' ', args),
-		stdout: binary ? null : stdout,
-		stderr,
-		exitcode,
-		binary
-	};
-};
-
 export function getTime(epoch) {
 	const local_time = localtime(epoch);
 	return replace(replace(sprintf(
@@ -66,21 +40,147 @@ export function getTime(epoch) {
 
 };
 
-export function wGET(url, ua) {
+export function wGET(url, ua, proxyUrl) {
 	if (!url || type(url) !== 'string')
 		return null;
 
 	if (!ua)
-		ua = 'Wget/1.21 (HomeProxy, like v2rayN)';
+		ua = 'v2rayN/7.23.4';
 
-	const output = executeCommand(`/usr/bin/wget -qO- --user-agent ${shellQuote(ua)} --timeout=10 ${shellQuote(url)}`) || {};
-	return trim(output.stdout);
+	const maxSize = 4 * 1024 * 1024;
+	const proxyArg = proxyUrl ? `--proxy ${shellQuote(proxyUrl)} ` : '';
+	const outfd = popen(
+		`/usr/bin/curl -fsSL --compressed --retry 3 --retry-all-errors --retry-delay 1 ` +
+		`--connect-timeout 10 --max-time 60 ` +
+		`--max-filesize ${maxSize} ${proxyArg}-A ${shellQuote(ua)} ${shellQuote(url)} ` +
+		`2>/dev/null`
+	);
+	if (!outfd)
+		return null;
+
+	let chunks = [], total = 0, oversized = false;
+	while (true) {
+		const chunk = outfd.read(64 * 1024);
+		if (chunk === null || chunk === '')
+			break;
+		total += length(chunk);
+		if (total > maxSize) {
+			oversized = true;
+			break;
+		}
+		push(chunks, chunk);
+	}
+	const exitcode = outfd.close();
+	const output = join('', chunks);
+
+	if (exitcode !== 0 || oversized || isBinary(output))
+		return null;
+
+	return trim(output);
 };
 /* Utilities end */
 
 /* String helper start */
 export function isEmpty(res) {
 	return !res || res === 'nil' || (type(res) in ['array', 'object'] && length(res) === 0);
+};
+
+export function normalizeList(value) {
+	if (isEmpty(value))
+		return [];
+	return (type(value) === 'array') ? value : [value];
+};
+
+export function filterExistingNodes(uci, config, value, onRemove) {
+	let nodes = normalizeList(value);
+	let result = [], seen = {};
+
+	for (let node in nodes) {
+		if (isEmpty(node) || seen[node])
+			continue;
+		seen[node] = true;
+
+		if (uci.get(config, node) !== 'node') {
+			if (type(onRemove) === 'function')
+				onRemove(node);
+			continue;
+		}
+
+		push(result, node);
+	}
+
+	return result;
+};
+
+export function reconcileUrltestNodes(uci, config, logger) {
+	let changed = false, removed = 0, disabled = 0;
+
+	function log(message) {
+		if (type(logger) === 'function')
+			logger(message);
+	}
+
+	function reconcileList(section, option) {
+		const current = uci.get(config, section, option);
+		const normalized = normalizeList(current);
+		const available = filterExistingNodes(uci, config, normalized, (node) => {
+			removed++;
+			log(sprintf('URLTest node %s is unavailable; removing it from %s.%s.', node, section, option));
+		});
+
+		if (sprintf('%J', normalized) !== sprintf('%J', available)) {
+			if (length(available))
+				uci.set(config, section, option, available);
+			else
+				uci.delete(config, section, option);
+			changed = true;
+		}
+
+		return available;
+	}
+
+	const mainNodes = reconcileList('config', 'main_urltest_nodes');
+	if (uci.get(config, 'config', 'main_node') === 'urltest' && !length(mainNodes)) {
+		const fallback = uci.get_first(config, 'node') || 'nil';
+		uci.set(config, 'config', 'main_node', fallback);
+		changed = true;
+		log((fallback === 'nil') ?
+			'Main URLTest group is empty; disabling the client.' :
+			sprintf('Main URLTest group is empty; switching to node %s.', fallback));
+	}
+
+	uci.foreach(config, 'routing_node', (section) => {
+		if (section.node !== 'urltest')
+			return;
+
+		const nodes = reconcileList(section['.name'], 'urltest_nodes');
+		if (section.enabled === '1' && !length(nodes)) {
+			uci.set(config, section['.name'], 'enabled', '0');
+			changed = true;
+			disabled++;
+			log(sprintf('Routing URLTest group %s is empty; disabling it.', section['.name']));
+		}
+	});
+
+	return {
+		changed,
+		removed,
+		disabled
+	};
+};
+
+export function hasForceProxyRules(uci, config, proxyDomainList) {
+	if (!isEmpty(proxyDomainList))
+		return true;
+
+	for (let option in [
+		'lan_proxy_ipv4_ips', 'lan_proxy_mac_addrs',
+		'wan_proxy_ipv4_ips', 'wan_proxy_ipv6_ips'
+	])
+		if (!isEmpty(uci.get(config, 'control', option)))
+			return true;
+
+	return false;
 };
 
 export function strToBool(str) {
@@ -133,75 +233,62 @@ export function renderEndpoint(node) {
 	};
 };
 
+export function renderV2RayTransport(node, server_mode) {
+	if (type(node) !== 'object' || isEmpty(node.transport))
+		return null;
+
+	switch (node.transport) {
+	case 'grpc':
+		return {
+			type: 'grpc',
+			service_name: node.grpc_servicename,
+			idle_timeout: strToTime(node.http_idle_timeout),
+			ping_timeout: strToTime(node.http_ping_timeout),
+			permit_without_stream: server_mode ? null : strToBool(node.grpc_permit_without_stream)
+		};
+	case 'http':
+		return {
+			type: 'http',
+			host: node.http_host,
+			path: node.http_path,
+			method: node.http_method,
+			idle_timeout: strToTime(node.http_idle_timeout),
+			ping_timeout: server_mode ? null : strToTime(node.http_ping_timeout)
+		};
+	case 'httpupgrade':
+		return {
+			type: 'httpupgrade',
+			host: node.httpupgrade_host,
+			path: node.http_path
+		};
+	case 'quic':
+		return { type: 'quic' };
+	case 'ws':
+		return {
+			type: 'ws',
+			path: node.ws_path,
+			headers: node.ws_host ? { Host: node.ws_host } : null,
+			max_early_data: strToInt(node.websocket_early_data),
+			early_data_header_name: node.websocket_early_data_header
+		};
+	default:
+		return null;
+	}
+};
+
 export function renderOutbound(node, routingMark) {
 	if (type(node) !== 'object' || isEmpty(node))
 		return null;
 
-	const tls_utls_value = (node.type === 'anytls' && isEmpty(node.tls_utls)) ? 'chrome' : node.tls_utls;
-	return {
-		type: node.type,
-		tag: 'cfg-' + node['.name'] + '-out',
-		routing_mark: strToInt(routingMark),
+	const renderTLS = () => {
+		if (node.tls !== '1' || !(node.type in [
+			'anytls', 'http', 'hysteria', 'hysteria2', 'shadowtls',
+			'trojan', 'tuic', 'vless', 'vmess'
+		]))
+			return null;
 
-		server: node.address,
-		server_port: strToInt(node.port),
-		server_ports: node.hysteria_hopping_port,
-
-		username: (node.type !== 'ssh') ? node.username : null,
-		user: (node.type === 'ssh') ? node.username : null,
-		password: node.password,
-
-		idle_session_check_interval: strToTime(node.anytls_idle_session_check_interval),
-		idle_session_timeout: strToTime(node.anytls_idle_session_timeout),
-		min_idle_session: strToInt(node.anytls_min_idle_session),
-		hop_interval: strToTime(node.hysteria_hop_interval),
-		up_mbps: strToInt(node.hysteria_up_mbps),
-		down_mbps: strToInt(node.hysteria_down_mbps),
-		obfs: node.hysteria_obfs_type ? {
-			type: node.hysteria_obfs_type,
-			password: node.hysteria_obfs_password
-		} : node.hysteria_obfs_password,
-		auth: (node.hysteria_auth_type === 'base64') ? node.hysteria_auth_payload : null,
-		auth_str: (node.hysteria_auth_type === 'string') ? node.hysteria_auth_payload : null,
-		recv_window_conn: strToInt(node.hysteria_recv_window_conn),
-		recv_window: strToInt(node.hysteria_revc_window),
-		disable_mtu_discovery: strToBool(node.hysteria_disable_mtu_discovery),
-		method: node.shadowsocks_encrypt_method,
-		plugin: node.shadowsocks_plugin,
-		plugin_opts: node.shadowsocks_plugin_opts,
-		version: (node.type === 'shadowtls') ? strToInt(node.shadowtls_version) : ((node.type === 'socks') ? node.socks_version : null),
-		client_version: node.ssh_client_version,
-		host_key: node.ssh_host_key,
-		host_key_algorithms: node.ssh_host_key_algo,
-		private_key: node.ssh_priv_key,
-		private_key_passphrase: node.ssh_priv_key_pp,
-		uuid: node.uuid,
-		congestion_control: node.tuic_congestion_control,
-		udp_relay_mode: node.tuic_udp_relay_mode,
-		udp_over_stream: strToBool(node.tuic_udp_over_stream),
-		zero_rtt_handshake: strToBool(node.tuic_enable_zero_rtt),
-		heartbeat: strToTime(node.tuic_heartbeat),
-		flow: node.vless_flow,
-		alter_id: strToInt(node.vmess_alterid),
-		security: node.vmess_encrypt,
-		global_padding: strToBool(node.vmess_global_padding),
-		authenticated_length: strToBool(node.vmess_authenticated_length),
-		packet_encoding: node.packet_encoding,
-
-		multiplex: (node.multiplex === '1') ? {
-			enabled: true,
-			protocol: node.multiplex_protocol,
-			max_connections: strToInt(node.multiplex_max_connections),
-			min_streams: strToInt(node.multiplex_min_streams),
-			max_streams: strToInt(node.multiplex_max_streams),
-			padding: strToBool(node.multiplex_padding),
-			brutal: (node.multiplex_brutal === '1') ? {
-				enabled: true,
-				up_mbps: strToInt(node.multiplex_brutal_up),
-				down_mbps: strToInt(node.multiplex_brutal_down)
-			} : null
-		} : null,
-		tls: (node.tls === '1') ? {
+		const tls_utls_value = (node.type === 'anytls' && isEmpty(node.tls_utls)) ? 'chrome' : node.tls_utls;
+		return {
 			enabled: true,
 			server_name: node.tls_sni,
 			insecure: strToBool(node.tls_insecure),
@@ -224,30 +311,133 @@ export function renderOutbound(node, routingMark) {
 				public_key: node.tls_reality_public_key,
 				short_id: node.tls_reality_short_id
 			} : null
-		} : null,
-		transport: !isEmpty(node.transport) ? {
-			type: node.transport,
-			host: node.http_host || node.httpupgrade_host,
-			path: node.http_path || node.ws_path,
-			headers: node.ws_host ? {
-				Host: node.ws_host
-			} : null,
-			method: node.http_method,
-			max_early_data: strToInt(node.websocket_early_data),
-			early_data_header_name: node.websocket_early_data_header,
-			service_name: node.grpc_servicename,
-			idle_timeout: strToTime(node.http_idle_timeout),
-			ping_timeout: strToTime(node.http_ping_timeout),
-			permit_without_stream: strToBool(node.grpc_permit_without_stream)
-		} : null,
-		udp_over_tcp: (node.udp_over_tcp === '1') ? {
+		};
+	};
+
+	const renderMultiplex = () => {
+		if (node.multiplex !== '1' || !(node.type in ['shadowsocks', 'trojan', 'vless', 'vmess']))
+			return null;
+		return {
 			enabled: true,
-			version: strToInt(node.udp_over_tcp_version)
-		} : null,
+			protocol: node.multiplex_protocol,
+			max_connections: strToInt(node.multiplex_max_connections),
+			min_streams: strToInt(node.multiplex_min_streams),
+			max_streams: strToInt(node.multiplex_max_streams),
+			padding: strToBool(node.multiplex_padding),
+			brutal: (node.multiplex_brutal === '1') ? {
+				enabled: true,
+				up_mbps: strToInt(node.multiplex_brutal_up),
+				down_mbps: strToInt(node.multiplex_brutal_down)
+			} : null
+		};
+	};
+
+	const outbound = {
+		type: node.type,
+		tag: 'cfg-' + node['.name'] + '-out',
+		routing_mark: strToInt(routingMark),
 		tcp_fast_open: strToBool(node.tcp_fast_open),
 		tcp_multi_path: strToBool(node.tcp_multi_path),
 		udp_fragment: strToBool(node.udp_fragment)
 	};
+
+	if (node.type !== 'direct') {
+		outbound.server = node.address;
+		outbound.server_port = strToInt(node.port);
+	}
+
+	switch (node.type) {
+	case 'anytls':
+		outbound.password = node.password;
+		outbound.idle_session_check_interval = strToTime(node.anytls_idle_session_check_interval);
+		outbound.idle_session_timeout = strToTime(node.anytls_idle_session_timeout);
+		outbound.min_idle_session = strToInt(node.anytls_min_idle_session);
+		break;
+	case 'http':
+		outbound.username = node.username;
+		outbound.password = node.password;
+		break;
+	case 'hysteria':
+	case 'hysteria2':
+		outbound.server_ports = node.hysteria_hopping_port;
+		outbound.hop_interval = strToTime(node.hysteria_hop_interval);
+		outbound.up_mbps = strToInt(node.hysteria_up_mbps);
+		outbound.down_mbps = strToInt(node.hysteria_down_mbps);
+		outbound.network = node.hysteria_network;
+		outbound.stream_receive_window = !isEmpty(node.hysteria_stream_receive_window) ? `${node.hysteria_stream_receive_window} B` : null;
+		outbound.connection_receive_window = !isEmpty(node.hysteria_connection_receive_window) ? `${node.hysteria_connection_receive_window} B` : null;
+		outbound.disable_path_mtu_discovery = strToBool(node.hysteria_disable_path_mtu_discovery);
+		outbound.obfs = (node.type === 'hysteria2' && node.hysteria_obfs_type) ? {
+			type: node.hysteria_obfs_type,
+			password: node.hysteria_obfs_password
+		} : node.hysteria_obfs_password;
+		if (node.type === 'hysteria') {
+			outbound.auth = (node.hysteria_auth_type === 'base64') ? node.hysteria_auth_payload : null;
+			outbound.auth_str = (node.hysteria_auth_type === 'string') ? node.hysteria_auth_payload : null;
+		} else
+			outbound.password = node.password;
+		break;
+	case 'shadowsocks':
+		outbound.method = node.shadowsocks_encrypt_method;
+		outbound.password = node.password;
+		outbound.plugin = node.shadowsocks_plugin;
+		outbound.plugin_opts = node.shadowsocks_plugin_opts;
+		break;
+	case 'shadowtls':
+		outbound.password = node.password;
+		outbound.version = strToInt(node.shadowtls_version);
+		break;
+	case 'socks':
+		outbound.username = node.username;
+		outbound.password = node.password;
+		outbound.version = node.socks_version;
+		outbound.udp_over_tcp = (node.udp_over_tcp === '1') ? {
+			enabled: true,
+			version: strToInt(node.udp_over_tcp_version)
+		} : null;
+		break;
+	case 'ssh':
+		outbound.user = node.username;
+		outbound.password = node.password;
+		outbound.client_version = node.ssh_client_version;
+		outbound.host_key = node.ssh_host_key;
+		outbound.host_key_algorithms = node.ssh_host_key_algo;
+		outbound.private_key = node.ssh_priv_key;
+		outbound.private_key_passphrase = node.ssh_priv_key_pp;
+		break;
+	case 'trojan':
+		outbound.password = node.password;
+		outbound.transport = renderV2RayTransport(node);
+		break;
+	case 'tuic':
+		outbound.uuid = node.uuid;
+		outbound.password = node.password;
+		outbound.congestion_control = node.tuic_congestion_control;
+		outbound.udp_relay_mode = node.tuic_udp_relay_mode;
+		outbound.udp_over_stream = strToBool(node.tuic_udp_over_stream);
+		outbound.zero_rtt_handshake = strToBool(node.tuic_enable_zero_rtt);
+		outbound.heartbeat = strToTime(node.tuic_heartbeat);
+		break;
+	case 'vless':
+		outbound.uuid = node.uuid;
+		outbound.flow = node.vless_flow;
+		outbound.packet_encoding = node.packet_encoding;
+		outbound.transport = renderV2RayTransport(node);
+		break;
+	case 'vmess':
+		outbound.uuid = node.uuid;
+		outbound.alter_id = strToInt(node.vmess_alterid);
+		outbound.security = node.vmess_encrypt;
+		outbound.global_padding = strToBool(node.vmess_global_padding);
+		outbound.authenticated_length = strToBool(node.vmess_authenticated_length);
+		outbound.packet_encoding = node.packet_encoding;
+		outbound.transport = renderV2RayTransport(node);
+		break;
+	}
+
+	outbound.tls = renderTLS();
+	outbound.multiplex = renderMultiplex();
+	return outbound;
 };
 
 export function removeBlankAttrs(res) {

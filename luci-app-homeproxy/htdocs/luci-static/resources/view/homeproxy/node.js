@@ -18,8 +18,9 @@
 const callNodeLatencyTest = rpc.declare({
 	object: 'luci.homeproxy',
 	method: 'node_latency_test',
-	params: ['node', 'mode'],
-	expect: { '': {} }
+	params: ['nodes'],
+	expect: { '': { results: [] } },
+	reject: true
 });
 
 function allowInsecureConfirm(ev, _section_id, value) {
@@ -101,7 +102,6 @@ function parseShareLink(uri, features) {
 				address: url.hostname,
 				port: url.port || '80',
 				hysteria_hopping_port: normalizeHysteriaHoppingPort(params.get('mport')),
-				hysteria_protocol: params.get('protocol') || 'udp',
 				hysteria_auth_type: params.get('auth') ? 'string' : null,
 				hysteria_auth_payload: params.get('auth'),
 				hysteria_obfs_password: params.get('obfsParam'),
@@ -143,7 +143,7 @@ function parseShareLink(uri, features) {
 		case 'socks':
 		case 'socks4':
 		case 'socks4a':
-		case 'socsk5':
+		case 'socks5':
 		case 'socks5h':
 			url = new URL('http://' + uri[1]);
 
@@ -427,61 +427,35 @@ const NODE_LATENCY_ROW_STATES = Object.freeze({
 });
 
 const NODE_LATENCY_ROW_STATE_VALUES = Object.freeze(Object.values(NODE_LATENCY_ROW_STATES));
-const NODE_LATENCY_TEST_MODES = Object.freeze([ 'icmp', 'rp' ]);
 
-function remapLegacyNodeLatencyTestMode(mode) {
-	return mode === 'tcp' ? 'icmp' : mode;
-}
+function resolveNodeLatencyResult(result) {
+	let state = result?.state;
+	let latency_ms = (result?.latency_ms != null) ? result.latency_ms : null;
+	let error = result?.error || null;
 
-function normalizeNodeLatencyTestMode(mode) {
-	mode = remapLegacyNodeLatencyTestMode(mode);
-	return NODE_LATENCY_TEST_MODES.includes(mode) ? mode : 'icmp';
-}
+	if (error?.code?.endsWith('_timeout'))
+		state = NODE_LATENCY_ROW_STATES.TIMEOUT;
+	else if (error)
+		state = NODE_LATENCY_ROW_STATES.ERROR;
+	else if (latency_ms != null)
+		state = NODE_LATENCY_ROW_STATES.SUCCESS;
 
-function resolveNodeLatencyResultByMode(result, mode) {
-	let active_mode = normalizeNodeLatencyTestMode(mode || result?.mode);
-	let active_latency_ms = (result && result.latency_ms != null) ? result.latency_ms : null;
-	let active_error = (result && result.error) ? result.error : null;
-	let active_state = result?.state;
-
-	if (active_mode === 'icmp') {
-		if (result && result.icmp_latency_ms != null)
-			active_latency_ms = result.icmp_latency_ms;
-		if (result && result.icmp_error)
-			active_error = result.icmp_error;
-	}
-
-	if (active_error?.code?.endsWith('_timeout'))
-		active_state = NODE_LATENCY_ROW_STATES.TIMEOUT;
-	else if (active_error)
-		active_state = NODE_LATENCY_ROW_STATES.ERROR;
-	else if (active_latency_ms != null)
-		active_state = NODE_LATENCY_ROW_STATES.SUCCESS;
-
-	return {
-		mode: active_mode,
-		state: active_state,
-		latency_ms: active_latency_ms,
-		error: active_error
-	};
+	return { state, latency_ms, error };
 }
 
 function getNodeLatencyErrorText(error_code) {
 	switch (error_code) {
-	case 'backend_execution failed':
+	case 'backend_execution_failed':
+	case 'runtime_launch_failed':
+	case 'runtime_prepare_failed':
 		return _('Backend execution failed');
-	case 'icmp_failed':
-		return _('ICMP Failed');
-	case 'icmp_probe_unavailable':
-		return _('ICMP Probe unavailable');
-	case 'icmp_timeout':
-		return _('ICMP Timeout');
+	case 'delay_failed':
+		return _('Probe failed');
+	case 'invalid_outbound':
 	case 'invalid_node':
 		return _('Invalid node');
 	case 'invalid_response':
 		return _('Invalid response');
-	case 'probe_failed':
-		return _('Probe failed');
 	case 'rpc_failed':
 		return _('RPC failed');
 	default:
@@ -491,7 +465,7 @@ function getNodeLatencyErrorText(error_code) {
 
 function getNodeLatencyStatusText(row_state) {
 	if (!row_state)
-		return _('Not Tested');
+		return _('Not tested');
 
 	switch (row_state.state) {
 	case NODE_LATENCY_ROW_STATES.TESTING:
@@ -504,7 +478,7 @@ function getNodeLatencyStatusText(row_state) {
 		return getNodeLatencyErrorText(row_state.error?.code);
 	case NODE_LATENCY_ROW_STATES.UNTESTED:
 	default:
-		return _('Not Tested');
+		return _('Not tested');
 	}
 }
 
@@ -634,17 +608,14 @@ function getActiveSubscriptionLatencySectionIds(root_el) {
 function createNodeLatencyRowStateModel() {
 	let rows = Object.create(null);
 
-	const buildRowState = (state, result, mode) => {
-		let resolved_result = resolveNodeLatencyResultByMode(result, mode);
+	const buildRowState = (state, result) => {
+		let resolved_result = resolveNodeLatencyResult(result);
 
 		return {
-		state: state,
-		mode: resolved_result.mode,
-		latency_ms: resolved_result.latency_ms,
-		icmp_latency_ms: (result && result.icmp_latency_ms != null) ? result.icmp_latency_ms : null,
-		measured_at: (result && result.measured_at) ? result.measured_at : null,
-		error: resolved_result.error,
-		icmp_error: (result && result.icmp_error) ? result.icmp_error : null
+			state: state,
+			latency_ms: resolved_result.latency_ms,
+			measured_at: (result && result.measured_at) ? result.measured_at : null,
+			error: resolved_result.error
 		};
 	};
 
@@ -657,10 +628,10 @@ function createNodeLatencyRowStateModel() {
 
 	const ensure = (section_id) => {
 		if (!section_id)
-			return buildRowState(NODE_LATENCY_ROW_STATES.UNTESTED, null, 'icmp');
+			return buildRowState(NODE_LATENCY_ROW_STATES.UNTESTED, null);
 
 		if (!rows[section_id])
-			rows[section_id] = buildRowState(NODE_LATENCY_ROW_STATES.UNTESTED, null, 'icmp');
+			rows[section_id] = buildRowState(NODE_LATENCY_ROW_STATES.UNTESTED, null);
 
 		return rows[section_id];
 	};
@@ -670,21 +641,21 @@ function createNodeLatencyRowStateModel() {
 
 		get: (section_id) => ensure(section_id),
 
-		set: (section_id, state, result, mode) => {
+		set: (section_id, state, result) => {
 			if (!section_id)
 				return null;
 
-			rows[section_id] = buildRowState(normalizeState(state), result, mode);
+			rows[section_id] = buildRowState(normalizeState(state), result);
 			return rows[section_id];
 		},
 
-		setFromProbeResult: (section_id, result, mode) => {
+		setFromProbeResult: (section_id, result) => {
 			if (!section_id)
 				return null;
 
-			let resolved_result = resolveNodeLatencyResultByMode(result, mode);
+			let resolved_result = resolveNodeLatencyResult(result);
 			let state = resolved_result.state ? normalizeState(resolved_result.state) : NODE_LATENCY_ROW_STATES.ERROR;
-			rows[section_id] = buildRowState(state, result, mode);
+			rows[section_id] = buildRowState(state, result);
 			return rows[section_id];
 		},
 
@@ -722,28 +693,11 @@ function renderNodeSettings(section, data, features, main_node, routing_mode, no
 	s.getNodeLatencyRowState = function(section_id) {
 		return node_latency_row_state.get(section_id);
 	}
-	s.getNodeLatencyTestMode = function() {
-		let mode_option = this.map.lookupOption('latency_test_mode', 'subscription')?.[0];
-		let mode_value = mode_option ? mode_option.formvalue('subscription') : uci.get(data[0], 'subscription', 'latency_test_mode');
-
-		return normalizeNodeLatencyTestMode(mode_value);
+	s.setNodeLatencyRowState = function(section_id, state, result) {
+		return node_latency_row_state.set(section_id, state, result);
 	}
-	s.syncNodeLatencyTestMode = function(mode) {
-		let normalized_mode = normalizeNodeLatencyTestMode(mode);
-		let saved_mode_value = uci.get(data[0], 'subscription', 'latency_test_mode');
-		let saved_mode = normalizeNodeLatencyTestMode(saved_mode_value);
-
-		if (saved_mode === normalized_mode && saved_mode_value !== 'tcp')
-			return Promise.resolve(normalized_mode);
-
-		uci.set(data[0], 'subscription', 'latency_test_mode', normalized_mode);
-		return uci.save().then(() => normalized_mode);
-	}
-	s.setNodeLatencyRowState = function(section_id, state, result, mode) {
-		return node_latency_row_state.set(section_id, state, result, mode);
-	}
-	s.setNodeLatencyRowStateFromProbeResult = function(section_id, result, mode) {
-		return node_latency_row_state.setFromProbeResult(section_id, result, mode);
+	s.setNodeLatencyRowStateFromProbeResult = function(section_id, result) {
+		return node_latency_row_state.setFromProbeResult(section_id, result);
 	}
 	s.refreshNodeLatencyRow = function(section_id) {
 		let row_state = this.getNodeLatencyRowState(section_id);
@@ -762,33 +716,45 @@ function renderNodeSettings(section, data, features, main_node, routing_mode, no
 		}
 	}
 
-	s.handleNodeLatencyTest = function(section_id) {
-		let mode = this.getNodeLatencyTestMode();
-		this.setNodeLatencyRowState(section_id, NODE_LATENCY_ROW_STATES.TESTING, null, mode);
-		this.refreshNodeLatencyRow(section_id);
+	s.handleNodeLatencyTests = function(section_ids) {
+		section_ids = Array.from(new Set(section_ids || [])).filter((sid) => !!sid);
+		for (let sid of section_ids) {
+			this.setNodeLatencyRowState(sid, NODE_LATENCY_ROW_STATES.TESTING, null);
+			this.refreshNodeLatencyRow(sid);
+		}
 
-		return this.syncNodeLatencyTestMode(mode).then((mode) => L.resolveDefault(callNodeLatencyTest(section_id, mode), null).then((result) => {
-			if (result?.node === section_id)
-				this.setNodeLatencyRowStateFromProbeResult(section_id, result, mode);
-			else
-				this.setNodeLatencyRowState(section_id, NODE_LATENCY_ROW_STATES.ERROR, {
-					mode: mode,
+		return callNodeLatencyTest(section_ids).then((response) => {
+			let results = Object.create(null);
+			for (let result of response?.results || [])
+				if (result?.node)
+					results[result.node] = result;
+
+			for (let sid of section_ids) {
+				if (results[sid])
+					this.setNodeLatencyRowStateFromProbeResult(sid, results[sid]);
+				else
+					this.setNodeLatencyRowState(sid, NODE_LATENCY_ROW_STATES.ERROR, {
+						error: {
+							code: 'invalid_response',
+							message: 'missing node latency result'
+						}
+					});
+			}
+		}).catch((err) => {
+			for (let sid of section_ids)
+				this.setNodeLatencyRowState(sid, NODE_LATENCY_ROW_STATES.ERROR, {
 					error: {
-						code: 'invalid_response',
-						message: 'unexpected node latency response'
+						code: 'rpc_failed',
+						message: String(err)
 					}
-				}, mode);
-		})).catch((err) => {
-			this.setNodeLatencyRowState(section_id, NODE_LATENCY_ROW_STATES.ERROR, {
-				mode: mode,
-				error: {
-					code: 'rpc_failed',
-					message: String(err)
-				}
-			}, mode);
+				});
 		}).then(() => {
-			this.refreshNodeLatencyRow(section_id);
+			for (let sid of section_ids)
+				this.refreshNodeLatencyRow(sid);
 		});
+	}
+	s.handleNodeLatencyTest = function(section_id) {
+		return this.handleNodeLatencyTests([section_id]);
 	}
 
 	if (routing_mode !== 'custom') {
@@ -851,7 +817,7 @@ function renderNodeSettings(section, data, features, main_node, routing_mode, no
 
 	o = s.option(form.Value, 'label', _('Label'));
 	o.load = L.bind(hp.loadDefaultLabel, this, data[0]);
-	o.validate = L.bind(hp.validateUniqueValue, this, data[0], 'node', 'label');
+	o.rmempty = false;
 	o.modalonly = true;
 
 	o = s.option(form.ListValue, 'type', _('Type'));
@@ -864,11 +830,11 @@ function renderNodeSettings(section, data, features, main_node, routing_mode, no
 	}
 	o.value('shadowsocks', _('Shadowsocks'));
 	o.value('shadowtls', _('ShadowTLS'));
-	o.value('socks', _('Socks'));
+	o.value('socks', _('SOCKS'));
 	o.value('ssh', _('SSH'));
 	o.value('trojan', _('Trojan'));
 	if (features.with_quic)
-		o.value('tuic', _('Tuic'));
+		o.value('tuic', _('TUIC'));
 	if (features.with_wireguard && features.with_gvisor)
 		o.value('wireguard', _('WireGuard'));
 	o.value('vless', _('VLESS'));
@@ -961,15 +927,13 @@ function renderNodeSettings(section, data, features, main_node, routing_mode, no
 	o.depends({'type': 'hysteria2', 'hysteria_hopping_port': /[\s\S]/});
 	o.modalonly = true;
 
-	o = s.option(form.ListValue, 'hysteria_protocol', _('Protocol'));
+	o = s.option(form.ListValue, 'hysteria_network', _('Network'));
+	o.value('', _('TCP and UDP'));
 	o.value('udp');
-	/* WeChat-Video / FakeTCP are unsupported by sing-box currently
-	 * o.value('wechat-video');
-	 * o.value('faketcp');
-	 */
-	o.default = 'udp';
+	o.value('tcp');
+	o.default = '';
 	o.depends('type', 'hysteria');
-	o.rmempty = false;
+	o.depends('type', 'hysteria2');
 	o.modalonly = true;
 
 	o = s.option(form.ListValue, 'hysteria_auth_type', _('Authentication type'));
@@ -1011,21 +975,24 @@ function renderNodeSettings(section, data, features, main_node, routing_mode, no
 	o.depends('type', 'hysteria2');
 	o.modalonly = true;
 
-	o = s.option(form.Value, 'hysteria_recv_window_conn', _('QUIC stream receive window'),
+	o = s.option(form.Value, 'hysteria_stream_receive_window', _('QUIC stream receive window'),
 		_('The QUIC stream-level flow control window for receiving data.'));
 	o.datatype = 'uinteger';
 	o.depends('type', 'hysteria');
+	o.depends('type', 'hysteria2');
 	o.modalonly = true;
 
-	o = s.option(form.Value, 'hysteria_revc_window', _('QUIC connection receive window'),
+	o = s.option(form.Value, 'hysteria_connection_receive_window', _('QUIC connection receive window'),
 		_('The QUIC connection-level flow control window for receiving data.'));
 	o.datatype = 'uinteger';
 	o.depends('type', 'hysteria');
+	o.depends('type', 'hysteria2');
 	o.modalonly = true;
 
-	o = s.option(form.Flag, 'hysteria_disable_mtu_discovery', _('Disable Path MTU discovery'),
+	o = s.option(form.Flag, 'hysteria_disable_path_mtu_discovery', _('Disable path MTU discovery'),
 		_('Disables Path MTU Discovery (RFC 8899). Packets will then be at most 1252 (IPv4) / 1232 (IPv6) bytes in size.'));
 	o.depends('type', 'hysteria');
+	o.depends('type', 'hysteria2');
 	o.modalonly = true;
 	/* Hysteria (2) config end */
 
@@ -1071,11 +1038,11 @@ function renderNodeSettings(section, data, features, main_node, routing_mode, no
 	o.rmempty = false;
 	o.modalonly = true;
 
-	/* Socks config */
-	o = s.option(form.ListValue, 'socks_version', _('Socks version'));
-	o.value('4', _('Socks4'));
-	o.value('4a', _('Socks4A'));
-	o.value('5', _('Socks5'));
+	/* SOCKS config */
+	o = s.option(form.ListValue, 'socks_version', _('SOCKS version'));
+	o.value('4', _('SOCKS4'));
+	o.value('4a', _('SOCKS4A'));
+	o.value('5', _('SOCKS5'));
 	o.default = '5';
 	o.depends('type', 'socks');
 	o.rmempty = false;
@@ -1151,7 +1118,7 @@ function renderNodeSettings(section, data, features, main_node, routing_mode, no
 	o.default = '10';
 	o.depends('type', 'tuic');
 	o.modalonly = true;
-	/* Tuic config end */
+	/* TUIC config end */
 
 	/* VMess / VLESS config start */
 	o = s.option(form.ListValue, 'vless_flow', _('Flow'));
@@ -1403,7 +1370,7 @@ function renderNodeSettings(section, data, features, main_node, routing_mode, no
 	o.modalonly = true;
 
 	o = s.option(form.Flag, 'multiplex_brutal', _('Enable TCP Brutal'),
-		_('Enable TCP Brutal congestion control algorithm'));
+		_('Enable TCP Brutal congestion control algorithm.'));
 	o.depends('multiplex', '1');
 	o.modalonly = true;
 
@@ -1434,9 +1401,11 @@ function renderNodeSettings(section, data, features, main_node, routing_mode, no
 	o.validate = function(section_id, _value) {
 		if (section_id) {
 			let type = this.map.lookupOption('type', section_id)[0].formvalue(section_id);
+			let transport_options = this.map.lookupOption('transport', section_id);
+			let transport = transport_options?.[0]?.formvalue(section_id);
 			let tls = this.map.findElement('id', 'cbid.homeproxy.%s.tls'.format(section_id)).firstElementChild;
 
-			if (['anytls', 'hysteria', 'hysteria2', 'shadowtls', 'tuic'].includes(type)) {
+			if (['anytls', 'hysteria', 'hysteria2', 'shadowtls', 'tuic'].includes(type) || transport === 'quic') {
 				tls.checked = true;
 				tls.disabled = true;
 			} else {
@@ -1582,10 +1551,10 @@ function renderNodeSettings(section, data, features, main_node, routing_mode, no
 	o = s.option(form.Flag, 'tcp_fast_open', _('TCP fast open'));
 	o.modalonly = true;
 
-	o = s.option(form.Flag, 'tcp_multi_path', _('MultiPath TCP'));
+	o = s.option(form.Flag, 'tcp_multi_path', _('TCP multi-path'));
 	o.modalonly = true;
 
-	o = s.option(form.Flag, 'udp_fragment', _('UDP Fragment'),
+	o = s.option(form.Flag, 'udp_fragment', _('UDP fragment'),
 		_('Enable UDP fragmentation.'));
 	o.modalonly = true;
 
@@ -1624,15 +1593,29 @@ return view.extend({
 		this.node_latency_row_state = node_latency_row_state;
 
 		/* Cache subscription information, it will be called multiple times */
-		let subinfo = [];
+		let subinfo = [], seen_subscriptions = {};
 		for (let suburl of (uci.get(data[0], 'subscription', 'subscription_url') || [])) {
-			const url = new URL(suburl);
 			const urlhash = hp.calcStringMD5(suburl.replace(/#.*$/, ''));
-			const title = url.hash ? decodeURIComponent(url.hash.slice(1)) : url.hostname;
+			if (seen_subscriptions[urlhash])
+				continue;
+			seen_subscriptions[urlhash] = true;
+			let title = suburl;
+			try {
+				const url = new URL(suburl);
+				if (url.hash) {
+					try {
+						title = decodeURIComponent(url.hash.slice(1));
+					} catch (e) {
+						title = url.hash.slice(1);
+					}
+				} else {
+					title = url.hostname;
+				}
+			} catch (e) { }
 			subinfo.push({ 'hash': urlhash, 'title': title });
 		}
 
-		m = new form.Map('homeproxy', _('Edit nodes'));
+		m = new form.Map('homeproxy', _('Edit Nodes'));
 
 		s = m.section(form.NamedSection, 'subscription', 'homeproxy');
 
@@ -1675,19 +1658,24 @@ return view.extend({
 								let packet_encoding = uci.get(data[0], 'subscription', 'packet_encoding');
 								let imported_node = 0;
 								input_links.forEach((l) => {
-									let config = parseShareLink(l, features);
-									if (config) {
+									let sid = null;
+									try {
+										let config = parseShareLink(l, features);
+										if (!config)
+											return;
 										if (config.tls === '1' && allow_insecure === '1')
 											config.tls_insecure = '1'
 										if (['vless', 'vmess'].includes(config.type))
 											config.packet_encoding = packet_encoding
 
-										let nameHash = hp.calcStringMD5(config.label);
-										let sid = uci.add(data[0], 'node', nameHash);
+										sid = uci.add(data[0], 'node');
 										Object.keys(config).forEach((k) => {
 											uci.set(data[0], sid, k, config[k]);
 										});
 										imported_node++;
+									} catch (e) {
+										if (sid)
+											uci.remove(data[0], sid);
 									}
 								});
 
@@ -1701,7 +1689,9 @@ return view.extend({
 									.then(L.bind(this.map.load, this.map))
 									.then(L.bind(this.map.reset, this.map))
 									.then(L.ui.hideModal)
-									.catch(() => {});
+									.catch((err) => {
+									ui.addNotification(null, E('p', _('Unknown error: %s.').format(err)), 'error');
+									});
 							} else {
 								return ui.hideModal();
 							}
@@ -1761,20 +1751,16 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.taboption('subscription', form.Value, 'auto_update_time', _('Cron expression'),
-			_('Minutes(0-59) Hours(0-23) Dates(1-31) Months(1-12) Weeks(0-6)'));
+			_('Minutes (0-59), hours (0-23), days (1-31), months (1-12), weekdays (0-6).') +
+			'<br/>' +
+			'<a target="_blank" rel="noreferrer noopener" href="https://cron.ren/cron-studio.html">' +
+			_('Cron expression online generator') + '</a>');
 		o.default = '0 */6 * * *';
 		o.placeholder = '0 */6 * * *';
 		o.rmempty = false;
 
 		o = s.taboption('subscription', form.Flag, 'update_via_proxy', _('Update via proxy'),
-			_('Update subscriptions via proxy.'));
-		o.rmempty = false;
-
-		o = s.taboption('subscription', form.ListValue, 'latency_test_mode', _('Latency test mode'),
-			_('Choose which method node latency tests use.'));
-		o.value('icmp', _('ICMP'));
-		o.value('rp', _('RP'));
-		o.default = 'icmp';
+			_('Update resources and subscriptions via proxy.'));
 		o.rmempty = false;
 
 		o = s.taboption('subscription', form.DynamicList, 'subscription_url', _('Subscription URLs'),
@@ -1808,7 +1794,9 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.taboption('subscription', form.Value, 'user_agent', _('User-Agent'));
-		o.placeholder = 'Wget/1.21 (HomeProxy, like v2rayN)';
+		o.default = 'v2rayN/7.23.4';
+		o.placeholder = 'v2rayN/7.23.4';
+		o.rmempty = false;
 
 		o = s.taboption('subscription', form.Flag, 'allow_insecure', _('Allow insecure'),
 			_('Allow insecure connection by default when adding nodes from subscriptions.') +
@@ -1847,7 +1835,7 @@ return view.extend({
 			return fs.exec_direct('/etc/homeproxy/scripts/update_subscriptions.uc').then((res) => {
 				return location.reload();
 			}).catch((err) => {
-				ui.addNotification(null, E('p', _('An error occurred during updating subscriptions: %s').format(err)));
+				ui.addNotification(null, E('p', _('An error occurred during updating subscriptions: %s.').format(err)));
 				return this.map.reset();
 			});
 		}
@@ -1881,9 +1869,6 @@ return view.extend({
 			if (subnodes.includes(uci.get(data[0], 'config', 'main_node')))
 				uci.set(data[0], 'config', 'main_node', 'nil');
 
-			if (subnodes.includes(uci.get(data[0], 'config', 'main_udp_node')))
-				uci.set(data[0], 'config', 'main_udp_node', 'nil');
-
 			this.inputtitle = _('%s nodes removed').format(subnodes.length);
 			this.readonly = true;
 
@@ -1897,26 +1882,30 @@ return view.extend({
 			let bulk_button = E('button', {
 				'class': 'cbi-button cbi-button-action hp-bulk-latency-test',
 				'click': ui.createHandlerFn(this, async () => {
-					if (bulk_testing || typeof globalThis === 'undefined' || !globalThis.__hpNodeLatencyTrigger)
+					if (bulk_testing || typeof globalThis === 'undefined')
 						return false;
 
 					let section_ids = getActiveSubscriptionLatencySectionIds(el);
 					if (!section_ids.length)
 						return false;
+					let target = globalThis.__hpNodeLatencySections?.[section_ids[0]];
+					if (!target)
+						return false;
 
 					bulk_testing = true;
-					bulk_button.textContent = _('Testing Current List...');
+					bulk_button.textContent = _('Testing current list...');
 					bulk_button.disabled = true;
 
-					for (let sid of section_ids)
-						await globalThis.__hpNodeLatencyTrigger(sid);
-
-					bulk_testing = false;
-					bulk_button.textContent = _('Test Current List');
-					bulk_button.disabled = false;
+					try {
+						await target.handleNodeLatencyTests(section_ids);
+					} finally {
+						bulk_testing = false;
+						bulk_button.textContent = _('Test current list');
+						bulk_button.disabled = false;
+					}
 					return true;
 				})
-			}, [ _('Test Current List') ]);
+			}, [ _('Test current list') ]);
 
 			let updateBulkButtonVisibility = () => {
 				bulk_button.style.display = shouldShowBulkLatencyButton(el) ? '' : 'none';
