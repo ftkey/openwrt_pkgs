@@ -7,9 +7,10 @@
 
 'use strict';
 
+import { unlink } from 'fs';
 import { cursor } from 'uci';
 import {
-	isEmpty, normalizeList, reconcileUrltestNodes, synchronizeNodeLabels
+	isEmpty, normalizeList, reconcileUrltestNodes, synchronizeNodeLabels, HP_DIR
 } from 'homeproxy';
 
 const uci = cursor();
@@ -37,6 +38,19 @@ function setDefault(section, option, value) {
 		uci.set(uciconfig, section, option, value);
 }
 
+function deleteOptions(section, options) {
+	for (let option in options)
+		if (uci.get(uciconfig, section, option) !== null)
+			uci.delete(uciconfig, section, option);
+}
+
+function deleteSections(sectionType) {
+	const sections = [];
+	uci.foreach(uciconfig, sectionType, (section) => push(sections, section['.name']));
+	for (let section in sections)
+		uci.delete(uciconfig, section);
+}
+
 function migrateOption(section, oldOption, newOption) {
 	const oldValue = uci.get(uciconfig, section, oldOption);
 	if (oldValue === null)
@@ -44,6 +58,15 @@ function migrateOption(section, oldOption, newOption) {
 	if (uci.get(uciconfig, section, newOption) === null)
 		uci.set(uciconfig, section, newOption, oldValue);
 	uci.delete(uciconfig, section, oldOption);
+}
+
+function moveOption(sourceSection, sourceOption, targetSection, targetOption) {
+	const sourceValue = uci.get(uciconfig, sourceSection, sourceOption);
+	if (sourceValue === null)
+		return;
+	if (uci.get(uciconfig, targetSection, targetOption) === null)
+		uci.set(uciconfig, targetSection, targetOption, sourceValue);
+	uci.delete(uciconfig, sourceSection, sourceOption);
 }
 
 function mergeListOption(section, sourceOption, targetOption) {
@@ -86,39 +109,26 @@ if (subscriptionNodeMigrationState !== subscriptionNodeMigration) {
 
 synchronizeNodeLabels(uci, uciconfig);
 
-/* Keep only the modes implemented by the 1.14 configuration generator. */
-if (!(uci.get(uciconfig, 'config', 'routing_mode') in ['bypass_mainland_china', 'custom', 'global']))
+/* Keep only the supported routing modes. */
+if (!(uci.get(uciconfig, 'config', 'routing_mode') in ['bypass_mainland_china', 'global']))
 	uci.set(uciconfig, 'config', 'routing_mode', 'bypass_mainland_china');
-if (!(uci.get(uciconfig, 'config', 'proxy_mode') in ['tun', 'tproxy']))
-	uci.set(uciconfig, 'config', 'proxy_mode', 'tun');
-
-for (let option in [
+deleteOptions('config', [
+	'proxy_mode',
 	'main_udp_node', 'main_udp_urltest_nodes',
 	'main_udp_urltest_interval', 'main_udp_urltest_tolerance',
 	'github_token', 'dashboard_download_url'
-])
-	if (uci.get(uciconfig, 'config', option) !== null)
-		uci.delete(uciconfig, 'config', option);
+]);
 
-for (let option in [
+deleteOptions('infra', [
 	'china_dns_port', 'redirect_port', 'tun_mark', 'tun_gso',
+	'tproxy_port', 'table_mark', 'self_mark', 'tproxy_mark',
 	'sniff_override', 'github_token'
-])
-	if (uci.get(uciconfig, 'infra', option) !== null)
-		uci.delete(uciconfig, 'infra', option);
-
-for (let option in ['endpoint_independent_nat', 'sniff_override'])
-	if (uci.get(uciconfig, 'routing', option) !== null)
-		uci.delete(uciconfig, 'routing', option);
-
-for (let option in ['independent_cache', 'cache_file_store_rdrc', 'cache_file_rdrc_timeout'])
-	if (uci.get(uciconfig, 'dns', option) !== null)
-		uci.delete(uciconfig, 'dns', option);
+]);
 
 if (uci.get(uciconfig, 'config', 'routing_port') === 'all')
 	uci.delete(uciconfig, 'config', 'routing_port');
-if (uci.get(uciconfig, 'routing', 'default_outbound') === 'block-out')
-	uci.set(uciconfig, 'routing', 'default_outbound', 'reject');
+
+moveOption('routing', 'tcpip_stack', 'config', 'tcpip_stack');
 
 for (let pair in [
 	['lan_gaming_mode_ipv4_ips', 'lan_proxy_ipv4_ips'],
@@ -128,12 +138,16 @@ for (let pair in [
 ])
 	mergeListOption('control', pair[0], pair[1]);
 
-for (let option in [
+deleteOptions('control', [
 	'lan_proxy_mode', 'lan_direct_ipv6_ips', 'lan_proxy_ipv6_ips',
 	'lan_global_proxy_ipv6_ips', 'lan_gaming_mode_ipv6_ips'
-])
-	if (uci.get(uciconfig, 'control', option) !== null)
-		uci.delete(uciconfig, 'control', option);
+]);
+
+for (let sectionType in ['routing_node', 'routing_rule', 'dns_server', 'dns_rule', 'ruleset'])
+	deleteSections(sectionType);
+for (let section in ['routing', 'dns'])
+	if (uci.get(uciconfig, section) !== null)
+		uci.delete(uciconfig, section);
 
 uci.foreach(uciconfig, 'node', (section) => {
 	for (let pair in [
@@ -142,13 +156,7 @@ uci.foreach(uciconfig, 'node', (section) => {
 		['hysteria_disable_mtu_discovery', 'hysteria_disable_path_mtu_discovery']
 	])
 		migrateOption(section['.name'], pair[0], pair[1]);
-	if (uci.get(uciconfig, section['.name'], 'hysteria_protocol') !== null)
-		uci.delete(uciconfig, section['.name'], 'hysteria_protocol');
-});
-
-uci.foreach(uciconfig, 'routing_node', (section) => {
-	if (section.node === 'urltest')
-		setDefault(section['.name'], 'urltest_interrupt_exist_connections', '0');
+	deleteOptions(section['.name'], ['hysteria_protocol']);
 });
 
 uci.foreach(uciconfig, 'server', (section) => {
@@ -160,8 +168,7 @@ uci.foreach(uciconfig, 'server', (section) => {
 		['hysteria_disable_mtu_discovery', 'hysteria_disable_path_mtu_discovery']
 	])
 		migrateOption(section['.name'], pair[0], pair[1]);
-	if (uci.get(uciconfig, section['.name'], 'hysteria_protocol') !== null)
-		uci.delete(uciconfig, section['.name'], 'hysteria_protocol');
+	deleteOptions(section['.name'], ['hysteria_protocol']);
 });
 
 /* These Telegram ranges were redundant after the old routing modes were removed. */
@@ -170,8 +177,7 @@ if (onlyContains(uci.get(uciconfig, 'control', 'wan_proxy_ipv4_ips'), stockWanPr
 if (onlyContains(uci.get(uciconfig, 'control', 'wan_proxy_ipv6_ips'), stockWanProxyIPv6))
 	uci.delete(uciconfig, 'control', 'wan_proxy_ipv6_ips');
 
-if (uci.get(uciconfig, 'subscription', 'latency_test_mode') !== null)
-	uci.delete(uciconfig, 'subscription', 'latency_test_mode');
+deleteOptions('subscription', ['latency_test_mode']);
 
 const subscriptionUserAgent = uci.get(uciconfig, 'subscription', 'user_agent');
 if (subscriptionUserAgent === 'v2rayN/7.23.4' ||
@@ -181,24 +187,12 @@ if (subscriptionUserAgent === 'v2rayN/7.23.4' ||
 setDefault('infra', 'ntp_server', 'nil');
 if (isEmpty(uci.get(uciconfig, 'infra', 'udp_timeout')))
 	uci.set(uciconfig, 'infra', 'udp_timeout', '300');
-setDefault('config', 'main_urltest_interval', '180');
+setDefault('config', 'main_urltest_interval', '90');
 setDefault('config', 'main_urltest_tolerance', '50');
 setDefault('config', 'main_urltest_interrupt_exist_connections', '0');
 setDefault('config', 'log_level', 'warn');
+setDefault('config', 'tcpip_stack', 'mixed');
 setDefault('control', 'lan_whitelist_mode', '0');
-setDefault('routing', 'tcpip_stack', 'mixed');
-if (isEmpty(uci.get(uciconfig, 'routing', 'udp_timeout')))
-	uci.set(uciconfig, 'routing', 'udp_timeout', '300');
-setDefault('routing', 'bypass_cn_traffic', '0');
-setDefault('routing', 'default_outbound', 'nil');
-setDefault('routing', 'default_outbound_dns', 'default-dns');
-setDefault('dns', 'default_strategy', 'prefer_ipv4');
-setDefault('dns', 'default_server', 'default-dns');
-setDefault('dns', 'disable_cache', '0');
-setDefault('dns', 'disable_cache_expire', '0');
-setDefault('dns', 'optimistic', '0');
-setDefault('dns', 'timeout', '10');
-setDefault('dns', 'cache_file_store_dns', '0');
 setDefault('server', 'log_level', 'warn');
 
 reconcileUrltestNodes(uci, uciconfig);
@@ -208,7 +202,8 @@ if (mainNode !== 'nil' && mainNode !== 'urltest' &&
 	uci.get(uciconfig, mainNode) !== 'node')
 	uci.set(uciconfig, 'config', 'main_node', uci.get_first(uciconfig, 'node') || 'nil');
 
-system('rm -f "/etc/homeproxy/resources/china_list.txt" "/etc/homeproxy/resources/china_list.ver" "/etc/homeproxy/resources/gfw_list.txt" "/etc/homeproxy/resources/gfw_list.ver"');
+for (let file in ['china_list.txt', 'china_list.ver', 'gfw_list.txt', 'gfw_list.ver'])
+	unlink(`${HP_DIR}/resources/${file}`);
 
 if (!isEmpty(uci.changes(uciconfig)) && uci.commit(uciconfig) !== true)
 	exit(1);

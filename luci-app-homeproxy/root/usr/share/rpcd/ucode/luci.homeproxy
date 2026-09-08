@@ -19,13 +19,9 @@ function hasKernelModule(kmod) {
 }
 
 const RESOURCES = {
-	china_ip4: {
-		source: 'https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/cncidr.txt',
-		version: `${HP_DIR}/resources/china_ip4.ver`
-	},
-	china_ip6: {
-		source: 'https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/cncidr.txt',
-		version: `${HP_DIR}/resources/china_ip6.ver`
+	geoip_cn: {
+		source: 'https://cdn.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-cn.srs',
+		version: `${HP_DIR}/resources/geoip_cn.ver`
 	},
 	geosite_cn: {
 		source: 'https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set-unstable/geosite-cn.srs',
@@ -256,9 +252,6 @@ const methods = {
 		call: function() {
 			const uci = cursor();
 			uci.load('homeproxy');
-			const routing_mode = uci.get('homeproxy', 'config', 'routing_mode') || 'bypass_mainland_china';
-			if (routing_mode === 'custom')
-				return { mode: 'custom', active: null, error: null };
 
 			const formatNode = (section_id, fallback_name) => {
 				if (!section_id || section_id in ['nil', 'same'])
