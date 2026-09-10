@@ -385,13 +385,13 @@ function add_mainland_rule_sets(rule_sets) {
 		type: 'local',
 		tag: 'geoip-cn',
 		format: 'binary',
-		path: HP_DIR + '/diversion/geoip_cn.srs'
+		path: HP_DIR + '/resources/geoip_cn.srs'
 	});
 	push(rule_sets, {
 		type: 'local',
 		tag: 'geosite-cn',
 		format: 'binary',
-		path: HP_DIR + '/diversion/geosite_cn.srs'
+		path: HP_DIR + '/resources/geosite_cn.srs'
 	});
 }
 
@@ -684,7 +684,7 @@ if (!isEmpty(main_node)) {
 		if (!length(urltest_nodes))
 			die('Main URLTest group has no available nodes.');
 		const main_urltest_interval = uci.get(uciconfig, ucimain, 'main_urltest_interval') || '120';
-		const main_urltest_tolerance = uci.get(uciconfig, ucimain, 'main_urltest_tolerance');
+		const main_urltest_tolerance = uci.get(uciconfig, ucimain, 'main_urltest_tolerance') || '60';
 		const main_urltest_interrupt = uci.get(uciconfig, ucimain, 'main_urltest_interrupt_exist_connections') || '0';
 
 		push(config.outbounds, {
